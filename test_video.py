@@ -1,10 +1,10 @@
 import cv2
-import ST7789
+import st7789
 from PIL import Image
 import time
 
 # 1. Khởi tạo màn hình - GPIO BCM đúng theo sơ đồ Raspberry Pi Zero
-disp = ST7789.ST7789(
+disp = st7789.ST7789(
     port=0,
     cs=0,           # Pin 24 -> CE0 (SPI)
     dc=24,          # Pin 18 -> GPIO 24 (BCM)
