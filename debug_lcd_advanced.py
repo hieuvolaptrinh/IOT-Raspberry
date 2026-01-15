@@ -11,7 +11,7 @@ import time
 def create_test_image(text, color=(255, 255, 255), bg=(255, 0, 0)):
     """Tạo ảnh test với text"""
     img = Image.new('RGB', (240, 240), bg)
-    draw = ImageDraw.Draw(img)
+    draw = ImageDraw.Draw(img)la /dev/spidev*
     # Vẽ text ở giữa
     draw.text((60, 100), text, fill=color)
     # Vẽ border để dễ nhận biết
