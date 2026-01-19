@@ -1,227 +1,209 @@
 #!/usr/bin/env python3
 """
-Hiển thị hình ảnh trên màn hình ST7789 LCD bằng thư viện Luma
-Raspberry Pi Zero 2 W + ST7789 1.54" SPI LCD (240x240)
+ST7789 LCD với Adafruit CircuitPython / Blinka
+Raspberry Pi Zero 2 W + ST7789 1.54" 240x240 LCD
 
-Cài đặt:
-    pip install luma.lcd pillow RPi.GPIO spidev
+=============================================
+         SƠ ĐỒ NỐI DÂY (8 PIN)
+=============================================
+LCD         Raspberry Pi Zero 2 W
+-----       ----------------------
+GND    -->  Pin 6  (GND)
+VCC    -->  Pin 1  (3.3V)
+SCL    -->  Pin 23 (GPIO11 - SCLK)
+SDA    -->  Pin 19 (GPIO10 - MOSI)
+DC     -->  Pin 22 (GPIO25) ← ĐỔI
+RST    -->  Pin 18 (GPIO24) ← ĐỔI
+CS     -->  Pin 24 (GPIO8 - CE0)
+BL     -->  Pin 12 (GPIO18)
+=============================================
 
-Nối dây:
-    LCD Pin     Raspberry Pi
-    -------     ------------
-    GND         Pin 6  (GND)
-    VCC         Pin 1  (3.3V)
-    SCL         Pin 23 (GPIO11/SCLK)
-    SDA         Pin 19 (GPIO10/MOSI)
-    DC          Pin 18 (GPIO24)
-    RST         Pin 22 (GPIO25)
-    CS          Pin 24 (GPIO8/CE0)
-    BL          Pin 12 (GPIO18)
+CÀI ĐẶT:
+    pip install adafruit-blinka
+    pip install adafruit-circuitpython-rgb-display
+    pip install pillow
 """
 
-from luma.core.interface.serial import spi
-from luma.lcd.device import st7789
-from PIL import Image, ImageDraw, ImageFont
 import time
-import RPi.GPIO as GPIO
+import digitalio
+import board
+from PIL import Image, ImageDraw, ImageFont
+import adafruit_rgb_display.st7789 as st7789
 
-# ============ CẤU HÌNH PIN ============
-DC_PIN = 24      # GPIO24 (Pin 18) - Data/Command
-RST_PIN = 25     # GPIO25 (Pin 22) - Reset
-BL_PIN = 18      # GPIO18 (Pin 12) - Backlight
+# ============ CẤU HÌNH ============
+# Theo chuẩn Adafruit
+CS_PIN = board.CE0       # GPIO8
+DC_PIN = board.D25       # GPIO25
+RST_PIN = board.D24      # GPIO24 (có thể None nếu ko dùng)
+BL_PIN = board.D18       # GPIO18 - Backlight
 
-# ============ CẤU HÌNH MÀN HÌNH ============
+# Kích thước màn hình
 WIDTH = 240
 HEIGHT = 240
-# Thử các giá trị khác nếu hình bị lệch
-H_OFFSET = 0     # Offset ngang (thử 0, 40, 80)
-V_OFFSET = 0     # Offset dọc (thử 0, 40, 80)
+ROTATION = 180  # Thử 0, 90, 180, 270 nếu hình bị ngược
 
-
-def setup_backlight():
-    """Bật backlight"""
-    try:
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(BL_PIN, GPIO.OUT)
-        GPIO.output(BL_PIN, GPIO.HIGH)
-        print("✓ Backlight: ON")
-        return True
-    except Exception as e:
-        print(f"⚠ Backlight lỗi: {e}")
-        return False
+# Tốc độ SPI (Hz)
+BAUDRATE = 24000000  # 24MHz
 
 
 def init_display():
-    """Khởi tạo màn hình LCD"""
-    print("\nĐang khởi tạo màn hình ST7789...")
+    """Khởi tạo màn hình ST7789"""
+    print("Đang khởi tạo ST7789...")
     
-    try:
-        # Cấu hình SPI - giảm tốc độ nếu không ổn định
-        serial = spi(
-            port=0, 
-            device=0,         # CE0 (GPIO8)
-            gpio_DC=DC_PIN,   # Data/Command pin
-            gpio_RST=RST_PIN, # Reset pin
-            bus_speed_hz=16000000  # 16MHz (ổn định hơn 40MHz)
-        )
-        
-        # Khởi tạo device ST7789
-        # Lưu ý: luma.lcd không có tham số invert, 
-        # màn hình 1.54" thường tự xử lý
-        device = st7789(
-            serial,
-            width=WIDTH,
-            height=HEIGHT,
-            h_offset=H_OFFSET,
-            v_offset=V_OFFSET,
-            rotate=0,    # 0, 1, 2, 3 = 0°, 90°, 180°, 270°
-            bgr=True     # True cho hầu hết màn ST7789
-        )
-        
-        print("✓ Khởi tạo ST7789 thành công!")
-        print(f"  - Kích thước: {WIDTH}x{HEIGHT}")
-        print(f"  - Offset: H={H_OFFSET}, V={V_OFFSET}")
-        return device
+    # Cấu hình pin
+    cs = digitalio.DigitalInOut(CS_PIN)
+    dc = digitalio.DigitalInOut(DC_PIN)
+    rst = digitalio.DigitalInOut(RST_PIN)
     
-    except Exception as e:
-        print(f"✗ Lỗi khởi tạo: {e}")
-        print("\n=== KIỂM TRA ===")
-        print("1. SPI đã bật? Chạy: sudo raspi-config -> Interface -> SPI -> Enable")
-        print("2. Đã cài thư viện? pip install luma.lcd pillow spidev RPi.GPIO")
-        print("3. Dây nối đúng chưa? Kiểm tra lại theo sơ đồ")
-        print("4. Kiểm tra SPI: ls /dev/spi*")
-        return None
+    # Bật backlight
+    bl = digitalio.DigitalInOut(BL_PIN)
+    bl.direction = digitalio.Direction.OUTPUT
+    bl.value = True
+    print("  → Backlight: ON")
+    
+    # Khởi tạo SPI
+    spi = board.SPI()
+    
+    # Tạo display object
+    disp = st7789.ST7789(
+        spi,
+        cs=cs,
+        dc=dc,
+        rst=rst,
+        baudrate=BAUDRATE,
+        width=WIDTH,
+        height=HEIGHT,
+        x_offset=0,
+        y_offset=0,
+        rotation=ROTATION
+    )
+    
+    print(f"  → Display: {WIDTH}x{HEIGHT}, rotation={ROTATION}")
+    print("✓ Khởi tạo thành công!")
+    
+    return disp, bl
 
 
-def display_solid_color(device, color, name=""):
-    """Hiển thị màu đơn sắc"""
+def fill_color(disp, color):
+    """Fill toàn màn hình với 1 màu"""
     img = Image.new("RGB", (WIDTH, HEIGHT), color)
-    device.display(img)
-    if name:
-        print(f"  ✓ Đã hiển thị: {name}")
+    disp.image(img)
 
 
-def display_hello(device):
-    """Hiển thị chữ Hello"""
-    img = Image.new("RGB", (WIDTH, HEIGHT), "black")
+def display_text(disp, text, font_size=48, text_color="white", bg_color="navy"):
+    """Hiển thị text ở giữa màn hình"""
+    # Tạo image
+    img = Image.new("RGB", (WIDTH, HEIGHT), bg_color)
     draw = ImageDraw.Draw(img)
     
     # Load font
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
-        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
     except:
         font = ImageFont.load_default()
-        small_font = font
         print("  (Dùng font mặc định)")
     
-    # Vẽ "Hello" ở giữa
-    text = "Hello"
+    # Tính vị trí căn giữa
     bbox = draw.textbbox((0, 0), text, font=font)
-    x = (WIDTH - (bbox[2] - bbox[0])) // 2
-    y = (HEIGHT - (bbox[3] - bbox[1])) // 2 - 20
-    draw.text((x, y), text, font=font, fill="white")
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x = (WIDTH - text_w) // 2
+    y = (HEIGHT - text_h) // 2
     
-    # Vẽ dòng phụ
-    sub = "Raspberry Pi"
-    bbox2 = draw.textbbox((0, 0), sub, font=small_font)
-    x2 = (WIDTH - (bbox2[2] - bbox2[0])) // 2
-    draw.text((x2, y + 60), sub, font=small_font, fill="lime")
+    # Vẽ text
+    draw.text((x, y), text, font=font, fill=text_color)
     
-    device.display(img)
-    print("✓ Đã hiển thị 'Hello'!")
+    # Hiển thị
+    disp.image(img)
 
 
-def display_test_pattern(device):
-    """Hiển thị test pattern để debug"""
+def test_pattern(disp):
+    """Hiển thị test pattern"""
     img = Image.new("RGB", (WIDTH, HEIGHT), "black")
     draw = ImageDraw.Draw(img)
     
-    # Vẽ 4 góc màu khác nhau
-    draw.rectangle([0, 0, 60, 60], fill="red")           # Góc trái trên
-    draw.rectangle([180, 0, 240, 60], fill="green")      # Góc phải trên
-    draw.rectangle([0, 180, 60, 240], fill="blue")       # Góc trái dưới
-    draw.rectangle([180, 180, 240, 240], fill="yellow")  # Góc phải dưới
+    # 4 góc màu khác nhau
+    draw.rectangle([0, 0, 60, 60], fill="red")
+    draw.rectangle([180, 0, 240, 60], fill="green")
+    draw.rectangle([0, 180, 60, 240], fill="blue")
+    draw.rectangle([180, 180, 240, 240], fill="yellow")
     
-    # Vẽ chữ thập ở giữa
+    # Chữ thập giữa
     draw.line([(120, 0), (120, 240)], fill="white", width=2)
     draw.line([(0, 120), (240, 120)], fill="white", width=2)
     
-    # Vẽ viền
+    # Viền
     draw.rectangle([0, 0, 239, 239], outline="white", width=2)
     
-    device.display(img)
-    print("✓ Đã hiển thị test pattern!")
-    print("  - Đỏ: góc trái trên")
-    print("  - Xanh lá: góc phải trên")
-    print("  - Xanh dương: góc trái dưới")
-    print("  - Vàng: góc phải dưới")
+    disp.image(img)
 
 
-def display_colors_test(device):
+def test_colors(disp):
     """Test các màu cơ bản"""
     colors = [
-        ("white", "Trắng"),
-        ("red", "Đỏ"),
-        ("green", "Xanh lá"),
-        ("blue", "Xanh dương"),
-        ("yellow", "Vàng"),
-        ("black", "Đen"),
+        ("red", "ĐỎ"),
+        ("green", "XANH LÁ"),
+        ("blue", "XANH DƯƠNG"),
+        ("white", "TRẮNG"),
+        ("yellow", "VÀNG"),
+        ("cyan", "CYAN"),
+        ("magenta", "HỒNG"),
+        ("black", "ĐEN"),
     ]
     
     for color, name in colors:
-        display_solid_color(device, color, name)
+        print(f"  → {name}")
+        fill_color(disp, color)
         time.sleep(0.5)
 
 
 def main():
     print("=" * 50)
-    print(" ST7789 1.54\" LCD - LUMA LIBRARY TEST")
+    print("  ST7789 - ADAFRUIT CIRCUITPYTHON")
     print("=" * 50)
-    
-    # Bước 1: Bật backlight
-    print("\n[1] Bật backlight...")
-    setup_backlight()
-    
-    # Bước 2: Khởi tạo display
-    print("\n[2] Khởi tạo màn hình...")
-    device = init_display()
-    if device is None:
-        return
-    
-    # Bước 3: Hiển thị màu trắng đầu tiên (dễ nhận biết nhất)
-    print("\n[3] Hiển thị màu trắng full màn hình...")
-    display_solid_color(device, "white", "TRẮNG - Nếu thấy màn hình sáng trắng là OK!")
-    time.sleep(2)
-    
-    # Bước 4: Test pattern
-    print("\n[4] Hiển thị test pattern...")
-    display_test_pattern(device)
-    time.sleep(2)
-    
-    # Bước 5: Test màu
-    print("\n[5] Test các màu...")
-    display_colors_test(device)
-    
-    # Bước 6: Hiển thị Hello
-    print("\n[6] Hiển thị Hello...")
-    display_hello(device)
-    
-    print("\n" + "=" * 50)
-    print("✓ HOÀN TẤT! Nếu không thấy gì, kiểm tra:")
-    print("  1. Dây BL (backlight) nối đúng?")
-    print("  2. Dây VCC có điện 3.3V?")
-    print("  3. Thử đổi H_OFFSET, V_OFFSET trong code")
-    print("=" * 50)
-    print("\nNhấn Ctrl+C để thoát.")
     
     try:
+        # Khởi tạo
+        print("\n[1] Khởi tạo display...")
+        disp, bl = init_display()
+        
+        # Test màu trắng trước
+        print("\n[2] Fill màu trắng...")
+        fill_color(disp, "white")
+        time.sleep(1)
+        
+        # Test pattern
+        print("\n[3] Test pattern...")
+        test_pattern(disp)
+        time.sleep(1)
+        
+        # Test colors
+        print("\n[4] Test các màu...")
+        test_colors(disp)
+        
+        # Hello
+        print("\n[5] Hiển thị 'Hello'...")
+        display_text(disp, "Hello", font_size=60, text_color="white", bg_color="darkblue")
+        
+        print("\n" + "=" * 50)
+        print("  ✓ TEST HOÀN TẤT!")
+        print("=" * 50)
+        print("\nNhấn Ctrl+C để thoát...")
+        
         while True:
             time.sleep(1)
+            
     except KeyboardInterrupt:
-        GPIO.cleanup()
-        print("\nĐã thoát và cleanup GPIO.")
+        print("\n\nĐang thoát...")
+    except Exception as e:
+        print(f"\n✗ LỖI: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n=== KIỂM TRA ===")
+        print("1. Đã cài thư viện chưa?")
+        print("   pip install adafruit-blinka adafruit-circuitpython-rgb-display pillow")
+        print("2. SPI đã bật? sudo raspi-config → Interface → SPI")
+        print("3. Dây nối đúng theo sơ đồ?")
 
 
 if __name__ == "__main__":
