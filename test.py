@@ -1,271 +1,180 @@
 #!/usr/bin/env python3
 """
-Hardware Debug Test for ST7789 1.54" LCD
-Direct SPI communication - bypass library issues
+FULL DEBUG for ST7789 LCD on Raspberry Pi
+LCD đã hoạt động với Arduino, cần debug kết nối với Pi
 """
-import RPi.GPIO as GPIO
-import spidev
+import os
 import time
 
-# GPIO Configuration
-DC = 25     # Data/Command
-RST = 27    # Reset
-BL = 18     # Backlight
-CS = 8      # Chip Select (CE0)
+print("=" * 60)
+print("  ST7789 FULL DEBUG - Raspberry Pi")
+print("=" * 60)
 
-# Display size
-WIDTH = 240
-HEIGHT = 240
+# ==================== CHECK 1: SPI ENABLED ====================
+print("\n[1] Kiểm tra SPI...")
+if os.path.exists("/dev/spidev0.0"):
+    print("    ✓ SPI0.0 đã bật")
+else:
+    print("    ✗ SPI CHƯA BẬT!")
+    print("    → Chạy: sudo raspi-config nonint do_spi 0")
+    print("    → Sau đó reboot")
+    exit(1)
 
-class ST7789_Direct:
-    def __init__(self):
-        # Setup GPIO
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        
-        GPIO.setup(DC, GPIO.OUT)
-        GPIO.setup(RST, GPIO.OUT)
-        GPIO.setup(BL, GPIO.OUT)
-        
-        # Setup SPI
-        self.spi = spidev.SpiDev()
-        self.spi.open(0, 0)
-        self.spi.max_speed_hz = 40000000
-        self.spi.mode = 0
-        
-        # Turn on backlight
-        GPIO.output(BL, GPIO.HIGH)
-        
-        # Initialize display
-        self._init_display()
-    
-    def _command(self, cmd):
-        """Send command"""
-        GPIO.output(DC, GPIO.LOW)
-        self.spi.xfer2([cmd])
-    
-    def _data(self, data):
-        """Send data"""
-        GPIO.output(DC, GPIO.HIGH)
-        if isinstance(data, list):
-            self.spi.xfer2(data)
-        else:
-            self.spi.xfer2([data])
-    
-    def _reset(self):
-        """Hardware reset"""
-        GPIO.output(RST, GPIO.HIGH)
-        time.sleep(0.05)
-        GPIO.output(RST, GPIO.LOW)
-        time.sleep(0.05)
-        GPIO.output(RST, GPIO.HIGH)
-        time.sleep(0.15)
-    
-    def _init_display(self):
-        """Initialize ST7789 display"""
-        print("Đang khởi tạo ST7789...")
-        
-        self._reset()
-        
-        # Software reset
-        self._command(0x01)
-        time.sleep(0.15)
-        
-        # Sleep out
-        self._command(0x11)
-        time.sleep(0.15)
-        
-        # Memory Data Access Control
-        self._command(0x36)
-        self._data(0x00)
-        
-        # Interface Pixel Format - 16bit/pixel
-        self._command(0x3A)
-        self._data(0x55)
-        
-        # Porch Setting
-        self._command(0xB2)
-        self._data([0x0C, 0x0C, 0x00, 0x33, 0x33])
-        
-        # Gate Control
-        self._command(0xB7)
-        self._data(0x35)
-        
-        # VCOM Setting
-        self._command(0xBB)
-        self._data(0x19)
-        
-        # LCM Control
-        self._command(0xC0)
-        self._data(0x2C)
-        
-        # VDV and VRH Command Enable
-        self._command(0xC2)
-        self._data(0x01)
-        
-        # VRH Set
-        self._command(0xC3)
-        self._data(0x12)
-        
-        # VDV Set
-        self._command(0xC4)
-        self._data(0x20)
-        
-        # Frame Rate Control
-        self._command(0xC6)
-        self._data(0x0F)
-        
-        # Power Control 1
-        self._command(0xD0)
-        self._data([0xA4, 0xA1])
-        
-        # Positive Voltage Gamma Control
-        self._command(0xE0)
-        self._data([0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F, 0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23])
-        
-        # Negative Voltage Gamma Control
-        self._command(0xE1)
-        self._data([0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F, 0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23])
-        
-        # Display Inversion On (some displays need this)
-        self._command(0x21)
-        
-        # Display ON
-        self._command(0x29)
-        time.sleep(0.1)
-        
-        print("✓ Khởi tạo hoàn tất!")
-    
-    def set_window(self, x0, y0, x1, y1):
-        """Set display window"""
-        # Column Address Set
-        self._command(0x2A)
-        self._data([x0 >> 8, x0 & 0xFF, x1 >> 8, x1 & 0xFF])
-        
-        # Row Address Set
-        self._command(0x2B)
-        self._data([y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF])
-        
-        # Memory Write
-        self._command(0x2C)
-    
-    def fill_color(self, color):
-        """Fill entire screen with RGB565 color"""
-        print(f"Đang fill màn hình với màu 0x{color:04X}...")
-        
-        self.set_window(0, 0, WIDTH - 1, HEIGHT - 1)
-        
-        # Prepare color data
-        high = (color >> 8) & 0xFF
-        low = color & 0xFF
-        
-        GPIO.output(DC, GPIO.HIGH)
-        
-        # Send in chunks for speed
-        chunk_size = 4096
-        pixel_data = [high, low] * (chunk_size // 2)
-        total_pixels = WIDTH * HEIGHT
-        
-        for i in range(0, total_pixels * 2, chunk_size):
-            remaining = min(chunk_size, total_pixels * 2 - i)
-            self.spi.xfer2(pixel_data[:remaining])
-        
-        print("✓ Fill hoàn tất!")
-    
-    def fill_test_pattern(self):
-        """Display test pattern with multiple colors"""
-        print("Đang hiển thị test pattern...")
-        
-        colors = [
-            (0xF800, "Đỏ"),      # Red
-            (0x07E0, "Xanh lá"), # Green
-            (0x001F, "Xanh dương"), # Blue
-            (0xFFE0, "Vàng"),    # Yellow
-            (0xFFFF, "Trắng"),   # White
-        ]
-        
-        section_height = HEIGHT // len(colors)
-        
-        for i, (color, name) in enumerate(colors):
-            y0 = i * section_height
-            y1 = (i + 1) * section_height - 1
-            
-            self.set_window(0, y0, WIDTH - 1, y1)
-            
-            high = (color >> 8) & 0xFF
-            low = color & 0xFF
-            
-            GPIO.output(DC, GPIO.HIGH)
-            
-            pixels = section_height * WIDTH
-            chunk_size = 4096
-            pixel_data = [high, low] * (chunk_size // 2)
-            
-            for j in range(0, pixels * 2, chunk_size):
-                remaining = min(chunk_size, pixels * 2 - j)
-                self.spi.xfer2(pixel_data[:remaining])
-            
-            print(f"  ✓ {name}")
-        
-        print("✓ Test pattern hoàn tất!")
-    
-    def cleanup(self):
-        """Cleanup GPIO"""
-        self.spi.close()
-        GPIO.cleanup()
+# ==================== CHECK 2: IMPORTS ====================
+print("\n[2] Kiểm tra thư viện...")
+try:
+    import RPi.GPIO as GPIO
+    print("    ✓ RPi.GPIO OK")
+except ImportError as e:
+    print(f"    ✗ RPi.GPIO lỗi: {e}")
+    exit(1)
 
+try:
+    import spidev
+    print("    ✓ spidev OK")
+except ImportError as e:
+    print(f"    ✗ spidev lỗi: {e}")
+    exit(1)
 
-def main():
-    print("=" * 50)
-    print("  ST7789 Direct SPI Test")
-    print("=" * 50)
-    print()
-    
-    try:
-        display = ST7789_Direct()
-        
-        # Test 1: Fill đỏ
-        print("\n[TEST 1] Fill màu ĐỎ...")
-        display.fill_color(0xF800)
-        input("Nhấn Enter để tiếp tục...")
-        
-        # Test 2: Fill xanh lá
-        print("\n[TEST 2] Fill màu XANH LÁ...")
-        display.fill_color(0x07E0)
-        input("Nhấn Enter để tiếp tục...")
-        
-        # Test 3: Fill xanh dương
-        print("\n[TEST 3] Fill màu XANH DƯƠNG...")
-        display.fill_color(0x001F)
-        input("Nhấn Enter để tiếp tục...")
-        
-        # Test 4: Pattern
-        print("\n[TEST 4] Test pattern nhiều màu...")
-        display.fill_test_pattern()
-        
-        print("\n" + "=" * 50)
-        print("  TEST HOÀN TẤT!")
-        print("=" * 50)
-        print("\nBạn có thấy màu sắc trên màn hình không?")
-        print("- Nếu CÓ: LCD hoạt động tốt!")
-        print("- Nếu KHÔNG: Có thể LCD bị lỗi hoặc cần kiểm tra dây")
-        print("\nNhấn Ctrl+C để thoát...")
-        
-        while True:
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        print("\nĐã dừng.")
-    except Exception as e:
-        print(f"\n❌ Lỗi: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        try:
-            display.cleanup()
-        except:
-            pass
+# ==================== GPIO SETUP ====================
+DC = 25
+RST = 27  
+BL = 18
 
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(DC, GPIO.OUT)
+GPIO.setup(RST, GPIO.OUT)
+GPIO.setup(BL, GPIO.OUT)
 
-if __name__ == "__main__":
-    main()
+# ==================== CHECK 3: BACKLIGHT ====================
+print("\n[3] Test Backlight...")
+GPIO.output(BL, GPIO.HIGH)
+print("    Backlight GPIO 18 = HIGH")
+print("    → Màn hình có sáng không? (kiểm tra bằng mắt)")
+
+# ==================== CHECK 4: SPI COMMUNICATION ====================
+print("\n[4] Khởi tạo SPI...")
+spi = spidev.SpiDev()
+spi.open(0, 0)
+spi.max_speed_hz = 10000000  # Giảm xuống 10MHz để ổn định
+spi.mode = 0b00  # Mode 0: CPOL=0, CPHA=0
+
+print(f"    SPI Speed: {spi.max_speed_hz} Hz")
+print(f"    SPI Mode: {spi.mode}")
+
+# ==================== HELPER FUNCTIONS ====================
+def command(cmd):
+    GPIO.output(DC, GPIO.LOW)
+    spi.xfer2([cmd])
+
+def data(val):
+    GPIO.output(DC, GPIO.HIGH)
+    if isinstance(val, list):
+        spi.xfer2(val)
+    else:
+        spi.xfer2([val])
+
+def reset():
+    GPIO.output(RST, GPIO.HIGH)
+    time.sleep(0.05)
+    GPIO.output(RST, GPIO.LOW)
+    time.sleep(0.05)
+    GPIO.output(RST, GPIO.HIGH)
+    time.sleep(0.15)
+
+# ==================== CHECK 5: RESET ====================
+print("\n[5] Hardware Reset...")
+reset()
+print("    ✓ Reset hoàn tất")
+
+# ==================== CHECK 6: INIT SEQUENCE ====================
+print("\n[6] Khởi tạo ST7789 (init sequence)...")
+
+# Sleep Out
+command(0x11)
+time.sleep(0.12)
+print("    → Sleep Out (0x11)")
+
+# Memory Data Access Control - THỬ NHIỀU GIÁ TRỊ
+# 0x00: Normal
+# 0x70: BGR + Mirror X + Mirror Y  
+# 0xC0: Mirror Y
+command(0x36)
+data(0x00)  # Thử 0x00, 0x70, 0xC0
+print("    → MADCTL (0x36) = 0x00")
+
+# Interface Pixel Format - 16bit RGB565
+command(0x3A)
+data(0x55)
+print("    → Pixel Format (0x3A) = 0x55 (16bit)")
+
+# Display Inversion ON - một số LCD cần, một số không
+command(0x21)
+print("    → Display Inversion ON (0x21)")
+
+# Display ON
+command(0x29)
+time.sleep(0.1)
+print("    → Display ON (0x29)")
+
+print("    ✓ Init hoàn tất")
+
+# ==================== CHECK 7: FILL COLOR ====================
+print("\n[7] Fill màn hình màu ĐỎ...")
+
+# Set Column Address (0-239)
+command(0x2A)
+data([0x00, 0x00, 0x00, 0xEF])
+
+# Set Row Address (0-239)
+command(0x2B)
+data([0x00, 0x00, 0x00, 0xEF])
+
+# Write Memory
+command(0x2C)
+
+# Send RED pixels (RGB565: 0xF800)
+GPIO.output(DC, GPIO.HIGH)
+red_high = 0xF8
+red_low = 0x00
+pixel_data = [red_high, red_low] * 512  # 512 pixels mỗi lần
+
+total_pixels = 240 * 240
+sent = 0
+while sent < total_pixels:
+    batch = min(512, total_pixels - sent)
+    spi.xfer2([red_high, red_low] * batch)
+    sent += batch
+
+print("    ✓ Đã gửi 240x240 pixels màu đỏ")
+
+# ==================== SUMMARY ====================
+print("\n" + "=" * 60)
+print("  DEBUG HOÀN TẤT")
+print("=" * 60)
+print("""
+Kết quả mong đợi: Màn hình hiển thị màu ĐỎ
+
+NẾU KHÔNG THẤY GÌ, kiểm tra:
+1. Dây SCL (GPIO 11 / Pin 23) - đảm bảo kết nối chắc
+2. Dây SDA (GPIO 10 / Pin 19) - đảm bảo kết nối chắc
+3. Dây DC  (GPIO 25 / Pin 22) - RẤT QUAN TRỌNG!
+4. Dây RST (GPIO 27 / Pin 13) - thử nối trực tiếp vào 3.3V
+
+THỬ THÊM:
+- Hoán đổi SCL và SDA (một số LCD ghi nhầm)
+- Giảm SPI speed xuống 1MHz
+- Kiểm tra nguồn 3.3V đủ mạnh không
+
+Nhấn Ctrl+C để thoát...
+""")
+
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\nĐang cleanup...")
+    spi.close()
+    GPIO.cleanup()
+    print("Đã dừng.")
