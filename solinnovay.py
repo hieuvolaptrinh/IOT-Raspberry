@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 TEST 4: solinnovay Python_ST7789 library
+Thư viện này dành cho màn hình 7-pin không có CS
+
 Cài đặt trước:
     cd ~
     git clone https://github.com/solinnovay/Python_ST7789.git
@@ -15,7 +17,7 @@ print(" TEST SOLINNOVAY Python_ST7789 - 1.54\"")
 print("=" * 50)
 
 try:
-    import ST7789
+    from ST7789 import ST7789
 except ImportError:
     print("❌ Chưa cài thư viện solinnovay!")
     print("\nCài đặt:")
@@ -25,25 +27,51 @@ except ImportError:
     print("  pip install .")
     exit(1)
 
-# Khởi tạo display
+# Cấu hình GPIO
+SPI_PORT = 0
+SPI_DEVICE = 0
+DC_PIN = 25       # GPIO25
+RST_PIN = 24      # GPIO24
+BL_PIN = 18       # GPIO18 (Backlight)
+
+# Bật backlight thủ công
+import RPi.GPIO as GPIO
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BL_PIN, GPIO.OUT)
+GPIO.output(BL_PIN, GPIO.HIGH)
+
+# Khởi tạo display - API của solinnovay
 print("\n→ Khởi tạo display...")
-disp = ST7789.ST7789(
-    port=0,
-    cs=0,
-    dc=25,
-    rst=24,
-    backlight=18,
-    spi_speed_hz=40000000,
-    width=240,
-    height=240
-)
-disp.begin()
+try:
+    disp = ST7789(
+        SPI_PORT,
+        SPI_DEVICE,
+        DC_PIN,
+        RST_PIN,
+        0,              # CS (không dùng = 0)
+        240,            # width
+        240,            # height
+        40000000        # SPI speed
+    )
+except TypeError:
+    # Thử API khác
+    print("  Thử API thay thế...")
+    disp = ST7789(
+        dc=DC_PIN,
+        rst=RST_PIN,
+        width=240,
+        height=240
+    )
+
+print("  ✓ Khởi tạo thành công!")
 
 # Test màu
 colors = [
     ("ĐỎ", "red"),
     ("XANH LÁ", "green"),
     ("XANH DƯƠNG", "blue"),
+    ("TRẮNG", "white"),
 ]
 
 for name, color in colors:
@@ -53,5 +81,5 @@ for name, color in colors:
     time.sleep(1)
 
 print("\n" + "=" * 50)
-print(" Test xong! Nếu thấy 3 màu → THÀNH CÔNG!")
+print(" Test xong! Nếu thấy 4 màu → THÀNH CÔNG!")
 print("=" * 50)
