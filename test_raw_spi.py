@@ -8,13 +8,13 @@ import RPi.GPIO as GPIO
 import time
 
 # ============ CẤU HÌNH PIN ============
-DC_PIN = 25      # Data/Command
-RST_PIN = 24     # Reset
+# DC_PIN = 25      # Data/Command
+# RST_PIN = 24     # Reset
 BL_PIN = 18      # Backlight
 
 # Nếu config trên không đúng, thử đổi:
-# DC_PIN = 24
-# RST_PIN = 25
+DC_PIN = 24
+RST_PIN = 25
 
 print("=" * 55)
 print(" RAW SPI DIAGNOSTIC - ST7789 1.54\"")
