@@ -46,6 +46,8 @@ current_audio_file = None
 video_thread = None
 stop_video_flag = False
 last_button_time = 0
+current_transcript = ""  # Lưu transcript để hiển thị
+scroll_offset = 0  # Vị trí scroll text
 
 # ============ GPIO + SPI SETUP ============
 try:
@@ -108,8 +110,17 @@ def init_lcd():
     cmd(0x13); time.sleep(0.01)
     cmd(0x29); time.sleep(0.12)
 
-def show_frame(frame):
+def show_frame(frame, overlay_text=None):
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
+    
+    # Overlay text ở góc dưới nếu có
+    if overlay_text:
+        # Tạo nền mờ cho text
+        cv2.rectangle(frame, (0, 200), (240, 240), (0, 0, 0), -1)
+        # Vẽ text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(frame, overlay_text, (5, 225), font, 0.5, (255, 255, 0), 1)
+    
     b = frame[:, :, 0].astype(np.uint16)
     g = frame[:, :, 1].astype(np.uint16)
     r = frame[:, :, 2].astype(np.uint16)
@@ -214,9 +225,9 @@ def send_to_api(audio_path):
         return None, None
 
 # ============ VIDEO PLAYBACK ============
-def play_video(video_url):
-    """Phát video từ URL (chạy trong thread riêng)"""
-    global current_state, stop_video_flag
+def play_video(video_url, transcript=""):
+    """Phát video từ URL với transcript cuộn ở dưới"""
+    global current_state, stop_video_flag, scroll_offset
     
     print(f"🎬 Đang phát video...")
     show_message(["Loading video...", "", "Please wait"], (100, 255, 100), (0, 50, 0))
@@ -229,15 +240,36 @@ def play_video(video_url):
         return
     
     current_state = State.PLAYING
+    scroll_offset = 0
+    frame_count = 0
+    
+    # Chuẩn bị text cuộn (thêm padding để cuộn mượt)
+    display_text = transcript if transcript else ""
+    max_chars = 25  # Số ký tự hiển thị tối đa
     
     try:
         while not stop_video_flag:
             ret, frame = cap.read()
             if not ret:
-                # Loop lại từ đầu
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
-            show_frame(frame)
+            
+            # Tính text hiển thị (cuộn nếu dài)
+            overlay = None
+            if display_text:
+                if len(display_text) <= max_chars:
+                    overlay = display_text
+                else:
+                    # Cuộn text mỗi 10 frame
+                    if frame_count % 10 == 0:
+                        scroll_offset = (scroll_offset + 1) % (len(display_text) + 5)
+                    
+                    padded_text = display_text + "     " + display_text
+                    overlay = padded_text[scroll_offset:scroll_offset + max_chars]
+            
+            show_frame(frame, overlay)
+            frame_count += 1
+            
     except Exception as e:
         print(f"Video error: {e}")
     finally:
@@ -247,12 +279,12 @@ def play_video(video_url):
         stop_video_flag = False
         show_message(["Ready!", "", "Press button", "to record"], (100, 255, 100))
 
-def start_video_thread(video_url):
+def start_video_thread(video_url, transcript=""):
     """Bắt đầu phát video trong thread riêng"""
     global video_thread, stop_video_flag
     
     stop_video_flag = False
-    video_thread = threading.Thread(target=play_video, args=(video_url,))
+    video_thread = threading.Thread(target=play_video, args=(video_url, transcript))
     video_thread.start()
 
 def stop_video():
@@ -297,8 +329,8 @@ def handle_button():
                 pass
             
             if video_url:
-                # Phát video
-                start_video_thread(video_url)
+                # Phát video với transcript
+                start_video_thread(video_url, transcript)
             else:
                 show_message(["API Error!", "", "Try again"], (255, 100, 100))
                 time.sleep(2)
