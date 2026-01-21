@@ -60,8 +60,8 @@ def init_lcd():
     cmd(0x11); time.sleep(0.12)  # Sleep out
     
     # MADCTL - Memory Access Control
-    # Bit 3 (0x08) = BGR order (quan trọng cho màu đúng!)
-    cmd(0x36); data(0x00)
+    # 0x08 = BGR order (fix màu đảo)
+    cmd(0x36); data(0x08)
     
     cmd(0x3A); data(0x55)  # 16-bit color (RGB565)
     
