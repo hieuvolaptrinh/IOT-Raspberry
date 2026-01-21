@@ -168,7 +168,19 @@ def stop_recording():
         record_process.wait()
         record_process = None
     
+    # Chờ file được flush hoàn toàn
+    time.sleep(0.5)
+    
     print("⏹️ DỪNG GHI ÂM")
+    
+    # Kiểm tra file
+    if current_audio_file and os.path.exists(current_audio_file):
+        size = os.path.getsize(current_audio_file)
+        print(f"✅ Đã lưu: {current_audio_file}")
+        print(f"📊 Kích thước: {size / 1024:.1f} KB")
+    else:
+        print("❌ Lỗi: Không lưu được file!")
+    
     current_state = State.PROCESSING
 
 # ============ API FUNCTIONS ============
@@ -274,7 +286,7 @@ def handle_button():
         # Dừng ghi âm và gửi API
         stop_recording()
         
-        if current_audio_file and os.path.exists(current_audio_file):
+        if current_audio_file and os.path.exists(current_audio_file) and os.path.getsize(current_audio_file) > 1000:
             video_url, transcript = send_to_api(current_audio_file)
             
             # Xóa file audio sau khi gửi
