@@ -1,21 +1,4 @@
-#!/usr/bin/env python3
-"""
-VOICE TO VSL - MAIN APPLICATION
-================================
-Raspberry Pi Zero 2 W + ST7789 LCD 240x240
 
-Flow hoạt động:
-1. Nhấn nút lần 1: Bắt đầu ghi âm (LED sáng)
-2. Nhấn nút lần 2: Dừng ghi âm → Gửi API → Nhận video_url → Phát video
-3. Nhấn nút 2 lần liên tiếp khi đang phát: Dừng video
-
-Kết nối phần cứng:
-  - Button: Pin 11 (GPIO 17) + Pin 9 (GND)
-  - LCD ST7789: DC=GPIO24, RST=GPIO25, BL=GPIO18, SPI0
-  - Mic: USB microphone
-
-Chạy: python main.py
-"""
 
 import cv2
 import numpy as np
