@@ -209,8 +209,8 @@ if __name__ == "__main__":
         print("    ✓ Thành công!")
         
         print("\n[2] Hiển thị hình ảnh...")
-        display.display_image("image.png")
-        print("    ✓ Đã hiển thị image.png!")
+        display.display_image("logo.JPG")
+        print("    ✓ Đã hiển thị logo.JPG!")
         
         print("\n" + "=" * 50)
         print(" ✓ HOÀN TẤT!")
