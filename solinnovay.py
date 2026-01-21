@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 TEST 4: solinnovay Python_ST7789 library
-Thư viện này có API đặc biệt - cần truyền GPIO object
+Thư viện này cần Adafruit_GPIO (không phải RPi.GPIO)
 
 Cài đặt:
+    pip install Adafruit-GPIO
     cd ~
     git clone https://github.com/solinnovay/Python_ST7789.git
     cd Python_ST7789
@@ -11,14 +12,25 @@ Cài đặt:
 """
 import time
 from PIL import Image
-import RPi.GPIO as GPIO
 
 print("=" * 50)
 print(" TEST SOLINNOVAY Python_ST7789 - 1.54\"")
 print("=" * 50)
 
+# Kiểm tra Adafruit_GPIO
+try:
+    import Adafruit_GPIO as GPIO
+    import Adafruit_GPIO.SPI as SPI
+    print("[1] Adafruit_GPIO: OK")
+except ImportError:
+    print("❌ Chưa cài Adafruit_GPIO!")
+    print("   Chạy: pip install Adafruit-GPIO")
+    exit(1)
+
+# Kiểm tra ST7789
 try:
     from ST7789 import ST7789
+    print("[2] ST7789 (solinnovay): OK")
 except ImportError:
     print("❌ Chưa cài thư viện solinnovay!")
     print("\nCài đặt:")
@@ -32,30 +44,28 @@ except ImportError:
 DC_PIN = 24       # GPIO24 - Data/Command
 RST_PIN = 25      # GPIO25 - Reset
 BL_PIN = 18       # GPIO18 - Backlight
-SPI_SPEED = 40000000
 
-# Setup GPIO trước
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
+# Bật backlight thủ công
+import RPi.GPIO as RGPIO
+RGPIO.setmode(RGPIO.BCM)
+RGPIO.setwarnings(False)
+RGPIO.setup(BL_PIN, RGPIO.OUT)
+RGPIO.output(BL_PIN, RGPIO.HIGH)
+print("[3] Backlight: ON")
 
-# Bật backlight
-GPIO.setup(BL_PIN, GPIO.OUT)
-GPIO.output(BL_PIN, GPIO.HIGH)
-print("\n[1] Backlight: ON")
-
-# Khởi tạo display - truyền GPIO object
-print("[2] Khởi tạo display...")
+# Khởi tạo display
+print("[4] Khởi tạo display...")
 try:
-    # API của solinnovay: ST7789(gpio, spi, dc, rst, width, height, speed)
-    import spidev
-    spi = spidev.SpiDev()
-    spi.open(0, 0)
-    spi.max_speed_hz = SPI_SPEED
-    spi.mode = 0
+    # Tạo SPI device
+    spi = SPI.SpiDev(0, 0, max_speed_hz=40000000)
     
+    # Tạo GPIO platform
+    gpio = GPIO.get_platform_gpio()
+    
+    # Khởi tạo ST7789
     disp = ST7789(
-        gpio=GPIO,
         spi=spi,
+        gpio=gpio,
         dc=DC_PIN,
         rst=RST_PIN,
         width=240,
@@ -63,35 +73,30 @@ try:
     )
     print("    ✓ Khởi tạo thành công!")
     
-except TypeError as e:
-    print(f"    Lỗi TypeError: {e}")
-    print("    Thử API khác...")
-    
-    # Thử API khác
-    try:
-        disp = ST7789(
-            GPIO,           # gpio object
-            DC_PIN,         # dc
-            RST_PIN,        # rst
-            240,            # width
-            240             # height
-        )
-        print("    ✓ Khởi tạo thành công (API 2)!")
-    except Exception as e2:
-        print(f"    Lỗi: {e2}")
-        print("\n⚠️  Thư viện solinnovay không tương thích.")
-        print("    Hãy thử chạy: python3 test_raw_spi.py")
-        GPIO.cleanup()
-        exit(1)
-
 except Exception as e:
     print(f"    Lỗi: {e}")
-    print("\n⚠️  Hãy thử chạy: python3 test_raw_spi.py")
-    GPIO.cleanup()
-    exit(1)
+    print("\n    Thử cách 2...")
+    
+    try:
+        # Thử không dùng SPI wrapper
+        disp = ST7789(
+            dc=DC_PIN,
+            rst=RST_PIN,
+            spi=SPI.SpiDev(0, 0)
+        )
+        print("    ✓ Khởi tạo thành công (cách 2)!")
+    except Exception as e2:
+        print(f"    Lỗi: {e2}")
+        print("\n⚠️  Thư viện không tương thích. Thử:")
+        print("    python3 test_final.py")
+        RGPIO.cleanup()
+        exit(1)
+
+# Bắt đầu display
+disp.begin()
 
 # Test màu
-print("\n[3] Test màu...")
+print("\n[5] Test màu...")
 colors = [
     ("ĐỎ", "red"),
     ("XANH LÁ", "green"),
@@ -108,4 +113,4 @@ for name, color in colors:
 print("\n" + "=" * 50)
 print(" Test xong!")
 print("=" * 50)
-GPIO.cleanup()
+RGPIO.cleanup()
