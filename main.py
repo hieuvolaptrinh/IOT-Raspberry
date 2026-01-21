@@ -25,7 +25,7 @@ BL_PIN = 18
 
 # ============ AUDIO SETTINGS ============
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-AUDIO_DEVICE = "plughw:1,0"
+AUDIO_DEVICE = "plughw:CARD=Device,DEV=0"  # USB PnP Sound Device
 SAMPLE_RATE = 44100
 CHANNELS = 1
 
