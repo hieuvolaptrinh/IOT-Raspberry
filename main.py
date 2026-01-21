@@ -1,5 +1,4 @@
 
-
 import cv2
 import numpy as np
 import spidev
@@ -11,6 +10,7 @@ import requests
 import threading
 from datetime import datetime
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
 
 # ============ LOAD .ENV ============
 load_dotenv()
@@ -32,6 +32,14 @@ CHANNELS = 1
 # ============ SPI SETTINGS ============
 SPI_MODE = 3
 SPI_SPEED = 32000000
+
+# ============ FONT SETTINGS ============
+FONT_PATH = os.path.join(SCRIPT_DIR, "SVN-Arial Regular.ttf")
+try:
+    FONT_VN = ImageFont.truetype(FONT_PATH, 18)
+except:
+    FONT_VN = ImageFont.load_default()
+    print("⚠️ Không tìm thấy font, dùng font mặc định")
 
 # ============ TRẠNG THÁI ============
 class State:
@@ -113,13 +121,20 @@ def init_lcd():
 def show_frame(frame, overlay_text=None):
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
     
-    # Overlay text ở góc dưới nếu có
+    # Overlay text ở góc dưới nếu có (dùng PIL cho tiếng Việt)
     if overlay_text:
-        # Tạo nền mờ cho text
-        cv2.rectangle(frame, (0, 200), (240, 240), (0, 0, 0), -1)
-        # Vẽ text
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(frame, overlay_text, (5, 225), font, 0.5, (255, 255, 0), 1)
+        # Convert BGR to RGB cho PIL
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame_rgb)
+        draw = ImageDraw.Draw(pil_img)
+        
+        # Vẽ nền đen cho text
+        draw.rectangle([(0, 205), (240, 240)], fill=(0, 0, 0))
+        # Vẽ text tiếng Việt
+        draw.text((5, 210), overlay_text, font=FONT_VN, fill=(255, 255, 0))
+        
+        # Convert lại về BGR cho OpenCV
+        frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     
     b = frame[:, :, 0].astype(np.uint16)
     g = frame[:, :, 1].astype(np.uint16)
