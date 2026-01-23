@@ -25,7 +25,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RECORDING_DIR = SCRIPT_DIR
 
 # Audio settings
-AUDIO_DEVICE = "plughw:1,0"  # USB mic thường là device 1 (chạy: arecord -l để xem)
+AUDIO_DEVICE = "plughw:0,0"  # USB PnP Sound Device (card 0)
+# AUDIO_DEVICE = "plughw:1,0"  # USB mic thường là device 1 (chạy: arecord -l để xem)
 SAMPLE_RATE = 44100
 CHANNELS = 1
 
