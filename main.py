@@ -25,16 +25,40 @@ BL_PIN = 18
 
 # ============ AUDIO SETTINGS ============
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# AUDIO_DEVICE = "plughw:CARD=Device,DEV=0"  
-AUDIO_DEVICE = "plughw:0,0"  # USB PnP Sound Device (card 0)
 SAMPLE_RATE = 44100
 CHANNELS = 1
 
-# ============ SPI SETTINGS ============
+def get_usb_audio_device():
+    """Tự động tìm USB Sound Device vì card number có thể thay đổi mỗi lần boot"""
+    try:
+        # Liệt kê tất cả capture devices
+        result = subprocess.run(['arecord', '-l'], capture_output=True, text=True)
+        lines = result.stdout.split('\n')
+        
+        for line in lines:
+            # Tìm USB sound device
+            if 'card' in line.lower() and ('usb' in line.lower() or 'pnp' in line.lower()):
+                # Lấy card number từ dòng như "card 0: Device [USB PnP Sound Device]..."
+                import re
+                match = re.search(r'card (\d+):', line)
+                if match:
+                    card_num = match.group(1)
+                    device = f"plughw:{card_num},0"
+                    print(f"🎤 Tìm thấy USB Audio: {line.strip()}")
+                    print(f"   → Sử dụng: {device}")
+                    return device
+        
+        print("⚠️ Không tìm thấy USB Audio, dùng mặc định: plughw:0,0")
+        return "plughw:0,0"
+    except Exception as e:
+        print(f"⚠️ Lỗi tìm audio device: {e}")
+        return "plughw:0,0"
+
+AUDIO_DEVICE = get_usb_audio_device()
+
 SPI_MODE = 3
 SPI_SPEED = 32000000
 
-# ============ FONT SETTINGS ============
 FONT_PATH = os.path.join(SCRIPT_DIR, "SVN-Arial Regular.ttf")
 try:
     FONT_VN = ImageFont.truetype(FONT_PATH, 18)
@@ -44,10 +68,10 @@ except:
 
 # ============ TRẠNG THÁI ============
 class State:
-    IDLE = 0           # Chờ nhấn nút
-    RECORDING = 1      # Đang ghi âm
-    PROCESSING = 2     # Đang gửi API
-    PLAYING = 3        # Đang phát video
+    IDLE = 0            
+    RECORDING = 1       
+    PROCESSING = 2      
+    PLAYING = 3         
 
 current_state = State.IDLE
 record_process = None
