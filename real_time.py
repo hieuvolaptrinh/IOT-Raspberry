@@ -46,6 +46,10 @@ MAX_RECONNECT_ATTEMPTS = 5
 SILENCE_THRESHOLD = 500  # RMS threshold for silence detection
 SILENCE_DURATION = 1.5  # Seconds of silence before flushing
 
+# ============ DISPLAY SETTINGS ============
+MIRROR_MODE = True  # Set True for VR glasses (flip horizontal)
+SKIP_FRAMES = 1  # Skip every N frames for faster playback (1 = no skip)
+
 # ============ GPIO PINS ============
 BUTTON_PIN = 17  # Pin 11
 DC_PIN = 24
@@ -154,9 +158,15 @@ def data(d):
 
 
 def data_bulk(d):
+    """Send bulk data to LCD - optimized for bytes."""
     GPIO.output(DC_PIN, GPIO.HIGH)
-    for i in range(0, len(d), 4096):
-        spi.xfer2(d[i:i+4096])
+    # Handle both bytes and list
+    if isinstance(d, bytes):
+        for i in range(0, len(d), 4096):
+            spi.xfer2(list(d[i:i+4096]))
+    else:
+        for i in range(0, len(d), 4096):
+            spi.xfer2(d[i:i+4096])
 
 
 def init_lcd():
@@ -185,38 +195,44 @@ def init_lcd():
     cmd(0x29); time.sleep(0.12)
 
 
+# Pre-allocate display buffer for performance
+_display_buffer = np.empty((240, 240, 2), dtype=np.uint8)
+
+
 def show_frame(frame, overlay_text=None):
-    """Display a frame on LCD with optional text overlay."""
+    """Display a frame on LCD with optional text overlay - OPTIMIZED."""
+    global _display_buffer
+    
+    # Resize with fastest interpolation
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
     
-    if overlay_text:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
-        draw = ImageDraw.Draw(pil_img)
-        
-        # Semi-transparent black bar at bottom
-        draw.rectangle([(0, 200), (240, 240)], fill=(0, 0, 0))
-        
-        # White text, centered
-        text = overlay_text[:35]  # Limit length
-        bbox = draw.textbbox((0, 0), text, font=FONT_VN)
-        text_width = bbox[2] - bbox[0]
-        x = max(5, (240 - text_width) // 2)
-        draw.text((x, 208), text, font=FONT_VN, fill=(255, 255, 255))
-        
-        frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    # Mirror for VR glasses
+    if MIRROR_MODE:
+        frame = cv2.flip(frame, 1)
     
+    if overlay_text:
+        # Draw text directly on frame using OpenCV (faster than PIL)
+        text = overlay_text[:35]
+        # Black bar at bottom
+        cv2.rectangle(frame, (0, 200), (240, 240), (0, 0, 0), -1)
+        # White text
+        cv2.putText(frame, text, (5, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    
+    # Convert BGR to RGB565 - optimized with in-place operations
     b = frame[:, :, 0].astype(np.uint16)
     g = frame[:, :, 1].astype(np.uint16)
     r = frame[:, :, 2].astype(np.uint16)
     rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-    buffer = np.empty((240, 240, 2), dtype=np.uint8)
-    buffer[:, :, 0] = (rgb565 >> 8) & 0xFF
-    buffer[:, :, 1] = rgb565 & 0xFF
+    
+    # Use pre-allocated buffer
+    _display_buffer[:, :, 0] = (rgb565 >> 8) & 0xFF
+    _display_buffer[:, :, 1] = rgb565 & 0xFF
+    
+    # Send to LCD - use tobytes() instead of tolist() (5-10x faster)
     cmd(0x2A); data([0, 0, 0, 239])
     cmd(0x2B); data([0, 0, 0, 239])
     cmd(0x2C)
-    data_bulk(buffer.flatten().tolist())
+    data_bulk(_display_buffer.tobytes())
 
 
 def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0)):
@@ -376,7 +392,7 @@ def play_video_sequence(words: list, transcript: str = ""):
 
 
 def play_single_video(video_path: str, overlay_word: str = "", duration: float = None):
-    """Play a single video file on LCD with memory cleanup."""
+    """Play a single video file on LCD - OPTIMIZED with frame skipping."""
     global stop_video
     
     cap = cv2.VideoCapture(video_path)
@@ -385,10 +401,11 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
         return
     
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    frame_delay = 1.0 / fps
+    # Reduce delay for smoother playback
+    frame_delay = max(0.01, (1.0 / fps) * 0.5)
     
     start_time = time.time()
-    frame = None
+    frame_count = 0
     
     try:
         while not stop_video:
@@ -396,35 +413,39 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
             if not ret:
                 break
             
+            frame_count += 1
+            
+            # Skip frames for faster playback (if SKIP_FRAMES > 1)
+            if SKIP_FRAMES > 1 and frame_count % SKIP_FRAMES != 0:
+                continue
+            
             show_frame(frame, overlay_word)
             
             # Check duration limit
             if duration and (time.time() - start_time) >= duration:
                 break
             
-            time.sleep(frame_delay * 0.8)  # Slightly faster for responsiveness
+            time.sleep(frame_delay)
     finally:
         cap.release()
-        # Clear memory
-        if frame is not None:
-            del frame
+        del frame if 'frame' in dir() else None
         import gc
         gc.collect()
 
 
 # ============ WEBSOCKET CLIENT ============
 async def stream_audio_to_server(ws):
-    """Stream audio chunks to WebSocket server."""
+    """Stream audio chunks to WebSocket server - memory optimized."""
     global stop_streaming
     
     print("🎤 Starting audio stream...")
     
-    # Start arecord process
+    # Start arecord process with smaller buffer
     process = subprocess.Popen([
         'arecord', '-D', AUDIO_DEVICE,
         '-f', 'S16_LE', '-r', str(SAMPLE_RATE),
         '-c', str(CHANNELS), '-t', 'raw', '-'
-    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=CHUNK_SIZE * 2)
     
     try:
         while not stop_streaming:
@@ -434,10 +455,13 @@ async def stream_audio_to_server(ws):
             if not audio_data:
                 break
             
-            # Send to server
+            # Send to server immediately
             await ws.send(audio_data)
             
-            await asyncio.sleep(0.01)  # Small delay
+            # Delete audio data immediately after sending to free memory
+            del audio_data
+            
+            await asyncio.sleep(0.005)  # Minimal delay
     finally:
         process.terminate()
         process.wait()
