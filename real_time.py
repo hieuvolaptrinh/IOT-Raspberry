@@ -28,7 +28,16 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ============ LOAD .ENV ============
 load_dotenv()
-API_URL = os.getenv("API_URL", "ws://172.20.10.3:8000")
+_api_url = os.getenv("API_URL", "ws://172.20.10.3:8000")
+
+# Auto-convert http:// to ws:// and https:// to wss://
+if _api_url.startswith("http://"):
+    API_URL = _api_url.replace("http://", "ws://", 1)
+elif _api_url.startswith("https://"):
+    API_URL = _api_url.replace("https://", "wss://", 1)
+else:
+    API_URL = _api_url
+
 WS_ENDPOINT = "/api/realtime/ws/vsl"
 
 # ============ CONNECTION SETTINGS ============
