@@ -158,15 +158,19 @@ def data(d):
 
 
 def data_bulk(d):
-    """Send bulk data to LCD - optimized for bytes."""
+    """Send bulk data to LCD - ULTRA OPTIMIZED with writebytes2."""
     GPIO.output(DC_PIN, GPIO.HIGH)
-    # Handle both bytes and list
+    # writebytes2 is faster than xfer2 for large data (no return buffer)
+    # Use larger chunks for fewer calls
+    CHUNK_SIZE = 32768  # 32KB chunks (was 4KB)
     if isinstance(d, bytes):
-        for i in range(0, len(d), 4096):
-            spi.xfer2(list(d[i:i+4096]))
+        for i in range(0, len(d), CHUNK_SIZE):
+            spi.writebytes2(d[i:i+CHUNK_SIZE])
     else:
-        for i in range(0, len(d), 4096):
-            spi.xfer2(d[i:i+4096])
+        # Convert to bytes first if it's a list
+        d_bytes = bytes(d)
+        for i in range(0, len(d_bytes), CHUNK_SIZE):
+            spi.writebytes2(d_bytes[i:i+CHUNK_SIZE])
 
 
 def init_lcd():
@@ -197,11 +201,12 @@ def init_lcd():
 
 # Pre-allocate display buffer for performance
 _display_buffer = np.empty((240, 240, 2), dtype=np.uint8)
+_rgb565_buffer = np.empty((240, 240), dtype=np.uint16)
 
 
 def show_frame(frame, overlay_text=None):
-    """Display a frame on LCD with optional text overlay - OPTIMIZED."""
-    global _display_buffer
+    """Display a frame on LCD - ULTRA OPTIMIZED."""
+    global _display_buffer, _rgb565_buffer
     
     # Resize with fastest interpolation
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
@@ -213,22 +218,25 @@ def show_frame(frame, overlay_text=None):
     if overlay_text:
         # Draw text directly on frame using OpenCV (faster than PIL)
         text = overlay_text[:35]
-        # Black bar at bottom
         cv2.rectangle(frame, (0, 200), (240, 240), (0, 0, 0), -1)
-        # White text
-        cv2.putText(frame, text, (5, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(frame, text, (5, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
-    # Convert BGR to RGB565 - optimized with in-place operations
-    b = frame[:, :, 0].astype(np.uint16)
-    g = frame[:, :, 1].astype(np.uint16)
-    r = frame[:, :, 2].astype(np.uint16)
-    rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+    # OPTIMIZED RGB565 conversion using numpy views (no copy)
+    # RGB565 = (R>>3)<<11 | (G>>2)<<5 | (B>>3)
+    np.add(
+        np.add(
+            np.left_shift(frame[:, :, 2].astype(np.uint16) >> 3, 11),
+            np.left_shift(frame[:, :, 1].astype(np.uint16) >> 2, 5)
+        ),
+        frame[:, :, 0].astype(np.uint16) >> 3,
+        out=_rgb565_buffer
+    )
     
-    # Use pre-allocated buffer
-    _display_buffer[:, :, 0] = (rgb565 >> 8) & 0xFF
-    _display_buffer[:, :, 1] = rgb565 & 0xFF
+    # Split into high/low bytes
+    _display_buffer[:, :, 0] = (_rgb565_buffer >> 8).astype(np.uint8)
+    _display_buffer[:, :, 1] = (_rgb565_buffer & 0xFF).astype(np.uint8)
     
-    # Send to LCD - use tobytes() instead of tolist() (5-10x faster)
+    # Send to LCD
     cmd(0x2A); data([0, 0, 0, 239])
     cmd(0x2B); data([0, 0, 0, 239])
     cmd(0x2C)
@@ -392,7 +400,7 @@ def play_video_sequence(words: list, transcript: str = ""):
 
 
 def play_single_video(video_path: str, overlay_word: str = "", duration: float = None):
-    """Play a single video file on LCD - OPTIMIZED with frame skipping."""
+    """Play a single video file on LCD - FIXED memory leaks and freezing."""
     global stop_video
     
     cap = cv2.VideoCapture(video_path)
@@ -400,12 +408,15 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
         print(f"❌ Cannot open: {video_path}")
         return
     
+    # Set buffer size to minimize memory usage
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    # Reduce delay for smoother playback
     frame_delay = max(0.01, (1.0 / fps) * 0.5)
     
     start_time = time.time()
     frame_count = 0
+    gc_interval = 10  # Run GC every N frames
     
     try:
         while not stop_video:
@@ -415,24 +426,31 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
             
             frame_count += 1
             
-            # Skip frames for faster playback (if SKIP_FRAMES > 1)
+            # Skip frames for faster playback
             if SKIP_FRAMES > 1 and frame_count % SKIP_FRAMES != 0:
+                del frame  # Important: release skipped frames
                 continue
             
             show_frame(frame, overlay_word)
+            
+            # Release frame memory immediately
+            del frame
+            
+            # Periodic garbage collection to prevent memory buildup
+            if frame_count % gc_interval == 0:
+                import gc
+                gc.collect()
             
             # Check duration limit
             if duration and (time.time() - start_time) >= duration:
                 break
             
             time.sleep(frame_delay)
+            
+    except Exception as e:
+        print(f"❌ Video playback error: {e}")
     finally:
         cap.release()
-        # Clear memory
-        try:
-            del frame
-        except:
-            pass
         import gc
         gc.collect()
 
