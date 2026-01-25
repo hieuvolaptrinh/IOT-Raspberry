@@ -109,11 +109,13 @@ AUDIO_DEVICE = get_usb_audio_device()
 
 # ============ FONT ============
 try:
-    FONT_VN = ImageFont.truetype(FONT_PATH, 18)
-    FONT_SMALL = ImageFont.truetype(FONT_PATH, 14)
+    FONT_VN = ImageFont.truetype(FONT_PATH, 22)  # Bigger font
+    FONT_SMALL = ImageFont.truetype(FONT_PATH, 16)
+    FONT_LARGE = ImageFont.truetype(FONT_PATH, 28)  # For titles
 except:
     FONT_VN = ImageFont.load_default()
     FONT_SMALL = ImageFont.load_default()
+    FONT_LARGE = ImageFont.load_default()
     print("⚠️ Font not found, using default")
 
 
@@ -192,8 +194,15 @@ def show_frame(frame, overlay_text=None):
         pil_img = Image.fromarray(frame_rgb)
         draw = ImageDraw.Draw(pil_img)
         
-        draw.rectangle([(0, 205), (240, 240)], fill=(0, 0, 0))
-        draw.text((5, 210), overlay_text[:30], font=FONT_VN, fill=(255, 255, 0))
+        # Semi-transparent black bar at bottom
+        draw.rectangle([(0, 200), (240, 240)], fill=(0, 0, 0))
+        
+        # White text, centered
+        text = overlay_text[:35]  # Limit length
+        bbox = draw.textbbox((0, 0), text, font=FONT_VN)
+        text_width = bbox[2] - bbox[0]
+        x = max(5, (240 - text_width) // 2)
+        draw.text((x, 208), text, font=FONT_VN, fill=(255, 255, 255))
         
         frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     
@@ -211,22 +220,22 @@ def show_frame(frame, overlay_text=None):
 
 
 def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0)):
-    """Display text message on LCD."""
+    """Display text message on LCD with white/bright colors."""
     pil_img = Image.new('RGB', (240, 240), bg_color)
     draw = ImageDraw.Draw(pil_img)
     
     if isinstance(lines, str):
         lines = lines.split('\n')
     
-    total_height = len(lines) * 30
+    total_height = len(lines) * 35  # Increased line height
     start_y = (240 - total_height) // 2
     
     for i, line in enumerate(lines):
         # Get text width for centering
         bbox = draw.textbbox((0, 0), line, font=FONT_VN)
         text_width = bbox[2] - bbox[0]
-        x = (240 - text_width) // 2
-        y = start_y + i * 30
+        x = max(5, (240 - text_width) // 2)
+        y = start_y + i * 35
         draw.text((x, y), line, font=FONT_VN, fill=color)
     
     frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -335,7 +344,7 @@ video_mapper = VideoMapper(VIDEO_DIR)
 
 # ============ VIDEO PLAYBACK ============
 def play_video_sequence(words: list, transcript: str = ""):
-    """Play sequence of videos for words."""
+    """Play sequence of videos for words with transcript overlay."""
     global current_state, stop_video
     
     current_state = State.PLAYING
@@ -351,7 +360,8 @@ def play_video_sequence(words: list, transcript: str = ""):
         
         if video_path:
             print(f"   ▶ {word} → {video_path.name}")
-            play_single_video(str(video_path), word)
+            # Show full transcript as overlay instead of just the word
+            play_single_video(str(video_path), transcript)
         else:
             # Fingerspell fallback
             print(f"   ✋ Fingerspelling: {word}")
@@ -359,15 +369,14 @@ def play_video_sequence(words: list, transcript: str = ""):
             for letter, letter_video in letters:
                 if stop_video:
                     break
-                play_single_video(str(letter_video), letter, duration=0.4)
+                play_single_video(str(letter_video), transcript, duration=0.4)
     
-    current_state = State.IDLE
+    current_state = State.RECORDING  # Go back to recording immediately
     stop_video = False
-    show_message(["Hoàn thành!", "", "Nhấn nút để", "tiếp tục"], (100, 255, 100))
 
 
 def play_single_video(video_path: str, overlay_word: str = "", duration: float = None):
-    """Play a single video file on LCD."""
+    """Play a single video file on LCD with memory cleanup."""
     global stop_video
     
     cap = cv2.VideoCapture(video_path)
@@ -379,6 +388,7 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
     frame_delay = 1.0 / fps
     
     start_time = time.time()
+    frame = None
     
     try:
         while not stop_video:
@@ -395,6 +405,11 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
             time.sleep(frame_delay * 0.8)  # Slightly faster for responsiveness
     finally:
         cap.release()
+        # Clear memory
+        if frame is not None:
+            del frame
+        import gc
+        gc.collect()
 
 
 # ============ WEBSOCKET CLIENT ============
@@ -458,26 +473,9 @@ async def receive_results(ws):
                 print(f"📊 Confidence: {confidence:.2f}")
                 
                 if words:
-                    # Show result text first
-                    show_message([
-                        "Nhận được:",
-                        transcript[:25] + "..." if len(transcript) > 25 else transcript,
-                        "",
-                        "→ " + vsl_text[:20]
-                    ], (255, 255, 100))
-                    time.sleep(1)
-                    
-                    # Play video sequence
+                    # Play video sequence with full transcript overlay
+                    # Mic keeps recording in background
                     play_video_sequence(words, transcript)
-                    
-                    # If still recording, show recording message again
-                    if is_recording:
-                        show_message([
-                            "🔴 ĐANG GHI ÂM",
-                            "",
-                            "Nói vào micro...",
-                            "Nhấn nút để dừng"
-                        ], (255, 100, 100), (50, 0, 0))
             
             elif msg_type == 'error':
                 print(f"❌ Error: {data.get('error')}")
