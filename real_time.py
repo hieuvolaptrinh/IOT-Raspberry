@@ -428,7 +428,11 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
             time.sleep(frame_delay)
     finally:
         cap.release()
-        del frame if 'frame' in dir() else None
+        # Clear memory
+        try:
+            del frame
+        except:
+            pass
         import gc
         gc.collect()
 
