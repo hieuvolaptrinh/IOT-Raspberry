@@ -448,7 +448,7 @@ print("Video worker thread started")
 
 
 def play_single_video(video_path: str, overlay_word: str = "", duration: float = None):
-    """Play a single video file on LCD - FULL PLAYBACK without skipping."""
+    """Play a single video file on LCD - FULL PLAYBACK with debug info."""
     global stop_video
     
     cap = cv2.VideoCapture(video_path)
@@ -458,13 +458,18 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
 
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
+    # Get video info
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    # Full speed playback (no speedup)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration = total_frames / fps if fps > 0 else 0
+    
+    print(f"   [Video: {total_frames} frames, {fps:.1f}fps, {video_duration:.2f}s]")
+    
+    # Full speed playback
     frame_delay = 1.0 / fps
     
-    start_time = time.time()
     frame_count = 0
-    gc_interval = 20  # Run GC every N frames
+    gc_interval = 20
     
     try:
         while not stop_video:
@@ -474,9 +479,8 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
             
             frame_count += 1
             
-            # Display every frame (no skipping)
+            # Display every frame
             show_frame(frame, overlay_word)
-
             del frame
 
             # Periodic GC
@@ -484,11 +488,13 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
                 import gc
                 gc.collect()
 
-            # Only check duration limit if set
-            if duration and (time.time() - start_time) >= duration:
+            # Only check duration limit for fingerspell
+            if duration and frame_count >= int(duration * fps):
                 break
             
             time.sleep(frame_delay)
+        
+        print(f"   [Played: {frame_count}/{total_frames} frames]")
             
     except Exception as e:
         print(f"Video playback error: {e}")
