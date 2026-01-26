@@ -40,12 +40,15 @@ SILENCE_DURATION = 1.5  # Seconds of silence before flushing
 MIRROR_MODE = True  # Set True for VR glasses (flip horizontal)
 SKIP_FRAMES = 1  # Skip every N frames for faster playback (1 = no skip)
 
-# Fingerspelling speed control
+# Video playback speed control
 # 1.0 = Normal speed (play full video)
 # 0.5 = Slower (2x longer, easier to see)
 # 2.0 = Faster (2x shorter, quicker but harder to see)
-# Recommended: 0.8-1.2 for best clarity
+# Recommended: 0.8-1.5 for best experience
+VIDEO_SPEED = 1.0  # General video playback speed
 FINGERSPELL_SPEED = 1.5
+
+
 
 # ============ GPIO PINS ============
 BUTTON_PIN = 17  # Pin 11
@@ -62,6 +65,32 @@ FONT_PATH = os.path.join(SCRIPT_DIR, "SVN-Arial Regular.ttf")
 SAMPLE_RATE = 16000  # Whisper expects 16kHz
 CHANNELS = 1
 CHUNK_SIZE = 8000  # 0.5 seconds of audio at 16kHz
+
+# Client-side filtering (reduce bandwidth, save server resources)
+ENABLE_CLIENT_FILTER = True  # Set False to disable client-side filtering
+CLIENT_MIN_RMS = 200  # Lower than server threshold (send borderline audio to server)
+
+
+def calculate_chunk_rms(audio_bytes: bytes) -> float:
+    """
+    Calculate RMS (Root Mean Square) of audio chunk for noise detection.
+    Quick check before sending to server to reduce bandwidth.
+    """
+    import struct
+    
+    if len(audio_bytes) < 2:
+        return 0.0
+    
+    # Unpack 16-bit signed integers
+    num_samples = len(audio_bytes) // 2
+    samples = struct.unpack(f'<{num_samples}h', audio_bytes)
+    
+    # Calculate RMS
+    sum_squares = sum(s * s for s in samples)
+    rms = (sum_squares / num_samples) ** 0.5 if num_samples > 0 else 0
+    
+    return rms
+
 
 # ============ STATE ============
 class State:
@@ -332,15 +361,32 @@ class VideoMapper:
             result.append(self.TONE_MAP.get(char, char))
         return ''.join(result)
     
+    def normalize_word(self, word: str) -> str:
+        """
+        Normalize word for matching: lowercase, remove punctuation.
+        
+        Examples:
+            "Tôi" -> "tôi"
+            "học!" -> "học"
+            "Xin chào," -> "xin chào"
+        """
+        import string
+        # Remove punctuation
+        word = word.translate(str.maketrans('', '', string.punctuation))
+        # Lowercase
+        word = word.lower().strip()
+        return word
+    
     def find_video(self, word: str) -> Path:
-        """
-        Find video file for a word.
-        Returns None if not found or file doesn't exist.
-        """
+
         if not word:
             return None
         
-        key = word.lower().strip()
+        # Normalize: lowercase + remove punctuation
+        key = self.normalize_word(word)
+        
+        if not key:  # Empty after normalization
+            return None
         
         # Strategy 1: Exact match
         if key in self.video_cache:
@@ -447,9 +493,9 @@ def video_playback_worker():
                 video_path = video_mapper.find_video(word)
                 
                 if video_path:
-                    # Found direct video - play at normal speed
+                    # Found direct video - play with VIDEO_SPEED
                     print(f"   ✓ {word} -> {video_path.name}")
-                    play_single_video(str(video_path), transcript, speed_multiplier=1.0)
+                    play_single_video(str(video_path), transcript, speed_multiplier=VIDEO_SPEED)
                     played_count += 1
                 else:
                     # Try fingerspelling fallback
@@ -575,10 +621,16 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
 
 # ============ WEBSOCKET CLIENT ============
 async def stream_audio_to_server(ws):
-    """Stream audio chunks to WebSocket server - memory optimized."""
+    """Stream audio chunks to WebSocket server with optional client-side filtering."""
     global stop_streaming
     
     print("🎤 Starting audio stream...")
+    if ENABLE_CLIENT_FILTER:
+        print(f"   Client-side filter: RMS >= {CLIENT_MIN_RMS}")
+    
+    # Stats for monitoring
+    chunks_sent = 0
+    chunks_filtered = 0
     
     # Start arecord process with smaller buffer
     process = subprocess.Popen([
@@ -595,8 +647,20 @@ async def stream_audio_to_server(ws):
             if not audio_data:
                 break
             
-            # Send to server immediately
+            # === CLIENT-SIDE FILTERING ===
+            if ENABLE_CLIENT_FILTER:
+                rms = calculate_chunk_rms(audio_data)
+                
+                if rms < CLIENT_MIN_RMS:
+                    # Skip this chunk (silence/noise)
+                    chunks_filtered += 1
+                    del audio_data
+                    await asyncio.sleep(0.005)
+                    continue
+            
+            # Send to server
             await ws.send(audio_data)
+            chunks_sent += 1
             
             # Delete audio data immediately after sending to free memory
             del audio_data
@@ -605,12 +669,16 @@ async def stream_audio_to_server(ws):
     finally:
         process.terminate()
         process.wait()
-        print("🎤 Audio stream stopped")
+        print(f"🎤 Audio stream stopped: {chunks_sent} sent, {chunks_filtered} filtered")
 
 
 async def receive_results(ws):
     """Receive and process results from server."""
     global current_state, stop_streaming
+    
+    # Stats for monitoring
+    results_received = 0
+    filtered_count = 0
     
     try:
         async for message in ws:
@@ -623,17 +691,29 @@ async def receive_results(ws):
             
             elif msg_type == 'buffering':
                 progress = data.get('progress', 0)
-                print(f"   Buffering: {progress*100:.0f}%")
+                # Only log every 25% to reduce spam
+                if int(progress * 4) != int((progress - 0.25) * 4):
+                    print(f"   Buffering: {progress*100:.0f}%")
+            
+            elif msg_type == 'filtered':
+                # Audio/transcription was filtered (noise/garbage)
+                filtered_count += 1
+                reason = data.get('reason', 'unknown')
+                # Only log occasionally to avoid spam
+                if filtered_count % 10 == 1:
+                    print(f"   🔇 Filtered ({filtered_count}x): {reason}")
             
             elif msg_type == 'result':
+                results_received += 1
                 transcript = data.get('transcript', '')
                 vsl_text = data.get('vsl_text', '')
                 words = data.get('words', [])
                 confidence = data.get('confidence', 0)
                 
-                print(f"Transcript: {transcript}")
-                print(f"VSL Text: {vsl_text}")
-                print(f"Confidence: {confidence:.2f}")
+                print(f"✅ Result #{results_received}:")
+                print(f"   Transcript: {transcript}")
+                print(f"   VSL Text: {vsl_text}")
+                print(f"   Confidence: {confidence:.2f}")
                 
                 if words:
                     play_video_sequence(words, transcript)
@@ -642,11 +722,17 @@ async def receive_results(ws):
                 print(f"Error: {data.get('error')}")
                 show_message(["Loi!", data.get('error', '')[:20]], (255, 100, 100))
             
+            elif msg_type == 'pong':
+                # Heartbeat response, ignore
+                pass
+            
             # Free message memory after processing
             del data, message
     
     except Exception as e:
         print(f"Receive error: {e}")
+    finally:
+        print(f"📊 Session stats: {results_received} results, {filtered_count} filtered")
 
 
 async def websocket_session():
