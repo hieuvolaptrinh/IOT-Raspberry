@@ -459,34 +459,27 @@ def video_playback_worker():
                     letters = video_mapper.get_fingerspell_videos(word)
                     
                     if letters and len(letters) > 0:
-                        # Can fingerspell - do it
+                        # Can fingerspell - play at normal speed (no duration limit)
                         print(f"   🔤 Fingerspelling: {word} ({len(letters)} letters)")
                         for letter, letter_video in letters:
                             if stop_video:
                                 break
-                            play_single_video(str(letter_video), transcript, duration=0.4)
+                            # Play full video for each letter (no duration limit)
+                            play_single_video(str(letter_video), transcript)
                         played_count += 1
                     else:
-                        # Cannot find video AND cannot fingerspell - SKIP
+                        # Cannot find video AND cannot fingerspell - SKIP silently
                         print(f"   ⚠️ SKIP: '{word}' (no video, cannot fingerspell)")
                         skipped_count += 1
                         skipped_words.append(word)
                         continue
             
-            # Summary
+            # Summary (console only, no LCD notification)
             print(f"   [Summary: {played_count} played, {skipped_count} skipped]")
             if skipped_words:
                 print(f"   [Skipped words: {', '.join(skipped_words)}]")
             
-            # Show brief notification if words were skipped
-            if skipped_count > 0 and not stop_video:
-                show_message([
-                    f"Bỏ qua {skipped_count} từ",
-                    "không có video",
-                    "",
-                    "Tiếp tục..."
-                ], (255, 200, 100), (50, 30, 0))
-                time.sleep(1.5)
+            # NO LCD notification for skipped words - just continue
             
             current_state = State.RECORDING
             stop_video = False
@@ -509,14 +502,13 @@ video_thread.start()
 print("Video worker thread started")
 
 
-def play_single_video(video_path: str, overlay_word: str = "", duration: float = None, max_duration: float = 10.0):
+def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0):
     """
     Play a single video file on LCD - FULL PLAYBACK with timeout protection.
     
     Args:
         video_path: Path to video file
         overlay_word: Text to display at bottom
-        duration: Max duration for fingerspell (seconds)
         max_duration: Absolute max duration to prevent hanging (default 10s)
     """
     global stop_video
@@ -565,14 +557,8 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
                 import gc
                 gc.collect()
 
-            # Check duration limits
+            # Absolute timeout protection only
             elapsed = time.time() - start_time
-            
-            # Fingerspell duration limit
-            if duration and elapsed >= duration:
-                break
-            
-            # Absolute timeout protection
             if elapsed >= max_duration:
                 print(f"   ⚠️ Timeout reached ({max_duration}s), stopping video")
                 break
