@@ -205,24 +205,39 @@ _rgb565_buffer = np.empty((240, 240), dtype=np.uint16)
 
 
 def show_frame(frame, overlay_text=None):
-    """Display a frame on LCD - ULTRA OPTIMIZED."""
+    """Display a frame on LCD - supports Vietnamese font and mirror mode."""
     global _display_buffer, _rgb565_buffer
     
     # Resize with fastest interpolation
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
     
-    # Mirror for VR glasses
+    # Add text overlay BEFORE mirroring (so text is mirrored too)
+    if overlay_text:
+        # Convert to PIL for Vietnamese font support
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame_rgb)
+        draw = ImageDraw.Draw(pil_img)
+        
+        # Black bar at bottom
+        draw.rectangle([(0, 200), (240, 240)], fill=(0, 0, 0))
+        
+        # White text, centered
+        text = overlay_text[:30]
+        try:
+            bbox = draw.textbbox((0, 0), text, font=FONT_VN)
+            text_width = bbox[2] - bbox[0]
+        except:
+            text_width = len(text) * 10
+        x = max(5, (240 - text_width) // 2)
+        draw.text((x, 210), text, font=FONT_VN, fill=(255, 255, 255))
+        
+        frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    
+    # Mirror for VR glasses AFTER adding text (so text is mirrored too)
     if MIRROR_MODE:
         frame = cv2.flip(frame, 1)
     
-    if overlay_text:
-        # Draw text directly on frame using OpenCV (faster than PIL)
-        text = overlay_text[:35]
-        cv2.rectangle(frame, (0, 200), (240, 240), (0, 0, 0), -1)
-        cv2.putText(frame, text, (5, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
-    # OPTIMIZED RGB565 conversion using numpy views (no copy)
-    # RGB565 = (R>>3)<<11 | (G>>2)<<5 | (B>>3)
+    # OPTIMIZED RGB565 conversion
     np.add(
         np.add(
             np.left_shift(frame[:, :, 2].astype(np.uint16) >> 3, 11),
@@ -540,9 +555,9 @@ async def websocket_session():
     try:
         async with websockets.connect(
             ws_url,
-            ping_interval=20,
-            ping_timeout=10,
-            close_timeout=5
+            ping_interval=30,   # Send ping every 30s
+            ping_timeout=60,    # Wait 60s for pong (allow long video playback)
+            close_timeout=10
         ) as ws:
             websocket_connected = True
             current_state = State.RECORDING
