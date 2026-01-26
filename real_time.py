@@ -448,22 +448,23 @@ print("Video worker thread started")
 
 
 def play_single_video(video_path: str, overlay_word: str = "", duration: float = None):
-    """Play a single video file on LCD - FIXED memory leaks and freezing."""
+    """Play a single video file on LCD - FULL PLAYBACK without skipping."""
     global stop_video
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"❌ Cannot open: {video_path}")
+        print(f"Cannot open: {video_path}")
         return
 
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    frame_delay = max(0.01, (1.0 / fps) * 0.5)
+    # Full speed playback (no speedup)
+    frame_delay = 1.0 / fps
     
     start_time = time.time()
     frame_count = 0
-    gc_interval = 10  # Run GC every N frames
+    gc_interval = 20  # Run GC every N frames
     
     try:
         while not stop_video:
@@ -473,26 +474,24 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
             
             frame_count += 1
             
-            # Skip frames for faster playback
-            if SKIP_FRAMES > 1 and frame_count % SKIP_FRAMES != 0:
-                del frame  # Important: release skipped frames
-                continue
-            
+            # Display every frame (no skipping)
             show_frame(frame, overlay_word)
 
             del frame
 
+            # Periodic GC
             if frame_count % gc_interval == 0:
                 import gc
                 gc.collect()
 
+            # Only check duration limit if set
             if duration and (time.time() - start_time) >= duration:
                 break
             
             time.sleep(frame_delay)
             
     except Exception as e:
-        print(f"❌ Video playback error: {e}")
+        print(f"Video playback error: {e}")
     finally:
         cap.release()
         import gc
@@ -606,15 +605,12 @@ async def websocket_session():
             receiver = asyncio.create_task(receive_results(ws))
             heartbeat = asyncio.create_task(send_heartbeat(ws))
             
-            # Wait for any to complete
-            done, pending = await asyncio.wait(
-                [sender, receiver, heartbeat],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
+            # Wait until stop_streaming is set or connection closes
+            # Use ALL_COMPLETED so session stays alive while any task runs
+            try:
+                await asyncio.gather(sender, receiver, heartbeat)
+            except Exception as e:
+                print(f"Task error: {e}")
     
     except websockets.exceptions.ConnectionClosed:
         print("🔌 Connection closed")
