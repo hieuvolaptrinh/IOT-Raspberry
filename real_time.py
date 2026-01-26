@@ -336,7 +336,10 @@ class VideoMapper:
         return ''.join(result)
     
     def find_video(self, word: str) -> Path:
-        """Find video file for a word."""
+        """
+        Find video file for a word.
+        Returns None if not found or file doesn't exist.
+        """
         if not word:
             return None
         
@@ -344,39 +347,67 @@ class VideoMapper:
         
         # Strategy 1: Exact match
         if key in self.video_cache:
-            return self.video_cache[key]
+            video_path = self.video_cache[key]
+            # Verify file still exists
+            if video_path.exists():
+                return video_path
+            else:
+                print(f"      ⚠️ Video file missing: {video_path}")
+                return None
         
         # Strategy 2: Windows reserved names (con → con_)
         if key in self.RESERVED_NAMES:
             key_reserved = key + '_'
             if key_reserved in self.video_cache:
-                return self.video_cache[key_reserved]
+                video_path = self.video_cache[key_reserved]
+                if video_path.exists():
+                    return video_path
         
         # Strategy 3: Underscore format
         key_underscore = key.replace(' ', '_')
         if key_underscore in self.video_cache:
-            return self.video_cache[key_underscore]
+            video_path = self.video_cache[key_underscore]
+            if video_path.exists():
+                return video_path
         
         # Strategy 4: Remove tone marks
         key_no_tone = self.normalize_for_pronunciation(key)
         if key_no_tone in self.video_cache:
-            return self.video_cache[key_no_tone]
+            video_path = self.video_cache[key_no_tone]
+            if video_path.exists():
+                return video_path
         
         return None
     
     def get_fingerspell_videos(self, word: str) -> list:
-        """Get list of videos for fingerspelling a word."""
+        """
+        Get list of videos for fingerspelling a word.
+        Returns empty list if cannot fingerspell (missing letter videos).
+        """
         result = []
+        missing_chars = []
+        
         for char in word.lower():
             if char.isalpha():
                 normalized = self.TONE_MAP.get(char, char)
                 video = self.find_video(normalized)
                 if video:
                     result.append((normalized, video))
+                else:
+                    missing_chars.append(char)
             elif char.isdigit():
                 video = self.find_video(char)
                 if video:
                     result.append((char, video))
+                else:
+                    missing_chars.append(char)
+            # Skip spaces and special characters
+        
+        # If any character is missing, cannot fingerspell properly
+        if missing_chars:
+            print(f"      Cannot fingerspell '{word}': missing videos for {missing_chars}")
+            return []
+        
         return result
 
 
@@ -408,6 +439,10 @@ def video_playback_worker():
             
             print(f"Playing sequence: {words}")
             
+            played_count = 0
+            skipped_count = 0
+            skipped_words = []
+            
             for word in words:
                 if stop_video:
                     break
@@ -415,16 +450,43 @@ def video_playback_worker():
                 video_path = video_mapper.find_video(word)
                 
                 if video_path:
-                    print(f"   > {word} -> {video_path.name}")
+                    # Found direct video - play it
+                    print(f"   ✓ {word} -> {video_path.name}")
                     play_single_video(str(video_path), transcript)
+                    played_count += 1
                 else:
-                    # Fingerspell fallback
-                    print(f"   Fingerspelling: {word}")
+                    # Try fingerspelling fallback
                     letters = video_mapper.get_fingerspell_videos(word)
-                    for letter, letter_video in letters:
-                        if stop_video:
-                            break
-                        play_single_video(str(letter_video), transcript, duration=0.4)
+                    
+                    if letters and len(letters) > 0:
+                        # Can fingerspell - do it
+                        print(f"   🔤 Fingerspelling: {word} ({len(letters)} letters)")
+                        for letter, letter_video in letters:
+                            if stop_video:
+                                break
+                            play_single_video(str(letter_video), transcript, duration=0.4)
+                        played_count += 1
+                    else:
+                        # Cannot find video AND cannot fingerspell - SKIP
+                        print(f"   ⚠️ SKIP: '{word}' (no video, cannot fingerspell)")
+                        skipped_count += 1
+                        skipped_words.append(word)
+                        continue
+            
+            # Summary
+            print(f"   [Summary: {played_count} played, {skipped_count} skipped]")
+            if skipped_words:
+                print(f"   [Skipped words: {', '.join(skipped_words)}]")
+            
+            # Show brief notification if words were skipped
+            if skipped_count > 0 and not stop_video:
+                show_message([
+                    f"Bỏ qua {skipped_count} từ",
+                    "không có video",
+                    "",
+                    "Tiếp tục..."
+                ], (255, 200, 100), (50, 30, 0))
+                time.sleep(1.5)
             
             current_state = State.RECORDING
             stop_video = False
@@ -447,13 +509,21 @@ video_thread.start()
 print("Video worker thread started")
 
 
-def play_single_video(video_path: str, overlay_word: str = "", duration: float = None):
-    """Play a single video file on LCD - FULL PLAYBACK with debug info."""
+def play_single_video(video_path: str, overlay_word: str = "", duration: float = None, max_duration: float = 10.0):
+    """
+    Play a single video file on LCD - FULL PLAYBACK with timeout protection.
+    
+    Args:
+        video_path: Path to video file
+        overlay_word: Text to display at bottom
+        duration: Max duration for fingerspell (seconds)
+        max_duration: Absolute max duration to prevent hanging (default 10s)
+    """
     global stop_video
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"Cannot open: {video_path}")
+        print(f"   ❌ Cannot open: {video_path}")
         return
 
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -463,13 +533,20 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_duration = total_frames / fps if fps > 0 else 0
     
+    # Safety check: skip if video is too long or corrupted
+    if video_duration > max_duration or video_duration <= 0:
+        print(f"   ⚠️ SKIP: Video too long ({video_duration:.1f}s) or corrupted")
+        cap.release()
+        return
+    
     print(f"   [Video: {total_frames} frames, {fps:.1f}fps, {video_duration:.2f}s]")
     
     # Full speed playback
-    frame_delay = 1.0 / fps
+    frame_delay = 1.0 / fps if fps > 0 else 0.04  # Fallback to 25fps
     
     frame_count = 0
     gc_interval = 20
+    start_time = time.time()
     
     try:
         while not stop_video:
@@ -488,16 +565,24 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
                 import gc
                 gc.collect()
 
-            # Only check duration limit for fingerspell
-            if duration and frame_count >= int(duration * fps):
+            # Check duration limits
+            elapsed = time.time() - start_time
+            
+            # Fingerspell duration limit
+            if duration and elapsed >= duration:
+                break
+            
+            # Absolute timeout protection
+            if elapsed >= max_duration:
+                print(f"   ⚠️ Timeout reached ({max_duration}s), stopping video")
                 break
             
             time.sleep(frame_delay)
         
-        print(f"   [Played: {frame_count}/{total_frames} frames]")
+        print(f"   [Played: {frame_count}/{total_frames} frames in {time.time() - start_time:.2f}s]")
             
     except Exception as e:
-        print(f"Video playback error: {e}")
+        print(f"   ❌ Video playback error: {e}")
     finally:
         cap.release()
         import gc
