@@ -499,8 +499,8 @@ async def receive_results(ws):
             msg_type = data.get('type', '')
             
             if msg_type == 'connected':
-                print(f"\u2705 Connected: {data.get('message')}")
-                show_message(["\u0110\u00e3 k\u1ebft n\u1ed1i!", "", "\u0110ang l\u1eafng nghe..."], (100, 255, 100))
+                print(f"Connected: {data.get('message')}")
+                show_message(["Da ket noi!", "", "Dang lang nghe..."], (100, 255, 100))
             
             elif msg_type == 'buffering':
                 progress = data.get('progress', 0)
@@ -512,22 +512,22 @@ async def receive_results(ws):
                 words = data.get('words', [])
                 confidence = data.get('confidence', 0)
                 
-                print(f"\n\ud83d\udcdd Transcript: {transcript}")
-                print(f"\ud83e\udd1f VSL Text: {vsl_text}")
-                print(f"\ud83d\udcca Confidence: {confidence:.2f}")
+                print(f"Transcript: {transcript}")
+                print(f"VSL Text: {vsl_text}")
+                print(f"Confidence: {confidence:.2f}")
                 
                 if words:
                     play_video_sequence(words, transcript)
             
             elif msg_type == 'error':
-                print(f"\u274c Error: {data.get('error')}")
-                show_message(["L\u1ed7i!", data.get('error', '')[:20]], (255, 100, 100))
+                print(f"Error: {data.get('error')}")
+                show_message(["Loi!", data.get('error', '')[:20]], (255, 100, 100))
             
             # Free message memory after processing
             del data, message
     
     except Exception as e:
-        print(f"\u274c Receive error: {e}")
+        print(f"Receive error: {e}")
 
 
 async def websocket_session():
