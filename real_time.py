@@ -1,13 +1,3 @@
-"""
-REAL-TIME VSL CLIENT FOR RASPBERRY PI
-Connects to backend WebSocket, streams audio, receives VSL text, and plays local videos.
-
-Features:
-- WebSocket connection to backend
-- Audio streaming from USB microphone
-- Local video playback from video/ folder
-- LCD display for visual feedback
-"""
 
 import cv2
 import numpy as np
@@ -49,6 +39,13 @@ SILENCE_DURATION = 1.5  # Seconds of silence before flushing
 # ============ DISPLAY SETTINGS ============
 MIRROR_MODE = True  # Set True for VR glasses (flip horizontal)
 SKIP_FRAMES = 1  # Skip every N frames for faster playback (1 = no skip)
+
+# Fingerspelling speed control
+# 1.0 = Normal speed (play full video)
+# 0.5 = Slower (2x longer, easier to see)
+# 2.0 = Faster (2x shorter, quicker but harder to see)
+# Recommended: 0.8-1.2 for best clarity
+FINGERSPELL_SPEED = 1.5
 
 # ============ GPIO PINS ============
 BUTTON_PIN = 17  # Pin 11
@@ -450,22 +447,22 @@ def video_playback_worker():
                 video_path = video_mapper.find_video(word)
                 
                 if video_path:
-                    # Found direct video - play it
+                    # Found direct video - play at normal speed
                     print(f"   ✓ {word} -> {video_path.name}")
-                    play_single_video(str(video_path), transcript)
+                    play_single_video(str(video_path), transcript, speed_multiplier=1.0)
                     played_count += 1
                 else:
                     # Try fingerspelling fallback
                     letters = video_mapper.get_fingerspell_videos(word)
                     
                     if letters and len(letters) > 0:
-                        # Can fingerspell - play at normal speed (no duration limit)
-                        print(f"   🔤 Fingerspelling: {word} ({len(letters)} letters)")
+                        # Can fingerspell - use FINGERSPELL_SPEED
+                        print(f"   🔤 Fingerspelling: {word} ({len(letters)} letters) at {FINGERSPELL_SPEED}x speed")
                         for letter, letter_video in letters:
                             if stop_video:
                                 break
-                            # Play full video for each letter (no duration limit)
-                            play_single_video(str(letter_video), transcript)
+                            # Play with fingerspell speed multiplier
+                            play_single_video(str(letter_video), transcript, speed_multiplier=FINGERSPELL_SPEED)
                         played_count += 1
                     else:
                         # Cannot find video AND cannot fingerspell - SKIP silently
@@ -502,7 +499,7 @@ video_thread.start()
 print("Video worker thread started")
 
 
-def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0):
+def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0, speed_multiplier: float = 1.0):
     """
     Play a single video file on LCD - FULL PLAYBACK with timeout protection.
     
@@ -510,6 +507,7 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
         video_path: Path to video file
         overlay_word: Text to display at bottom
         max_duration: Absolute max duration to prevent hanging (default 10s)
+        speed_multiplier: Speed multiplier (1.0 = normal, 0.5 = slower, 2.0 = faster)
     """
     global stop_video
     
@@ -531,10 +529,10 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
         cap.release()
         return
     
-    print(f"   [Video: {total_frames} frames, {fps:.1f}fps, {video_duration:.2f}s]")
+    print(f"   [Video: {total_frames} frames, {fps:.1f}fps, {video_duration:.2f}s, speed={speed_multiplier}x]")
     
-    # Full speed playback
-    frame_delay = 1.0 / fps if fps > 0 else 0.04  # Fallback to 25fps
+    # Adjust playback speed with multiplier
+    frame_delay = (1.0 / fps if fps > 0 else 0.04) / speed_multiplier
     
     frame_count = 0
     gc_interval = 20
