@@ -384,37 +384,67 @@ class VideoMapper:
 video_mapper = VideoMapper(VIDEO_DIR)
 
 
-# ============ VIDEO PLAYBACK ============
-def play_video_sequence(words: list, transcript: str = ""):
-    """Play sequence of videos for words with transcript overlay."""
-    global current_state, stop_video
+# ============ VIDEO PLAYBACK (THREADED) ============
+# Queue for video playback tasks
+import queue
+video_queue = queue.Queue()
+video_thread_running = True
+
+
+def video_playback_worker():
+    """Worker thread that plays videos from queue - doesn't block WebSocket."""
+    global video_thread_running, current_state, stop_video
     
-    current_state = State.PLAYING
-    stop_video = False
-    
-    print(f"🎬 Playing sequence: {words}")
-    
-    for word in words:
-        if stop_video:
-            break
-        
-        video_path = video_mapper.find_video(word)
-        
-        if video_path:
-            print(f"   ▶ {word} → {video_path.name}")
-            # Show full transcript as overlay instead of just the word
-            play_single_video(str(video_path), transcript)
-        else:
-            # Fingerspell fallback
-            print(f"   ✋ Fingerspelling: {word}")
-            letters = video_mapper.get_fingerspell_videos(word)
-            for letter, letter_video in letters:
+    while video_thread_running:
+        try:
+            # Wait for video task with timeout (to check running flag)
+            task = video_queue.get(timeout=0.5)
+            if task is None:
+                continue
+            
+            words, transcript = task
+            current_state = State.PLAYING
+            stop_video = False
+            
+            print(f"Playing sequence: {words}")
+            
+            for word in words:
                 if stop_video:
                     break
-                play_single_video(str(letter_video), transcript, duration=0.4)
-    
-    current_state = State.RECORDING  # Go back to recording immediately
-    stop_video = False
+                
+                video_path = video_mapper.find_video(word)
+                
+                if video_path:
+                    print(f"   > {word} -> {video_path.name}")
+                    play_single_video(str(video_path), transcript)
+                else:
+                    # Fingerspell fallback
+                    print(f"   Fingerspelling: {word}")
+                    letters = video_mapper.get_fingerspell_videos(word)
+                    for letter, letter_video in letters:
+                        if stop_video:
+                            break
+                        play_single_video(str(letter_video), transcript, duration=0.4)
+            
+            current_state = State.RECORDING
+            stop_video = False
+            video_queue.task_done()
+            
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Video worker error: {e}")
+
+
+def play_video_sequence(words: list, transcript: str = ""):
+    """Queue video sequence for playback in background thread."""
+    video_queue.put((words, transcript))
+
+
+# Start video worker thread
+video_thread = threading.Thread(target=video_playback_worker, daemon=True)
+video_thread.start()
+print("Video worker thread started")
 
 
 def play_single_video(video_path: str, overlay_word: str = "", duration: float = None):
