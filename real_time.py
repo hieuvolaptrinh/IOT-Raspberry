@@ -264,6 +264,9 @@ def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0)):
     
     frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     show_frame(frame)
+    
+    # Free memory
+    del pil_img, draw, frame
 
 
 # ============ VIDEO MAPPER ============
@@ -407,8 +410,7 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
     if not cap.isOpened():
         print(f"❌ Cannot open: {video_path}")
         return
-    
-    # Set buffer size to minimize memory usage
+
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
@@ -432,16 +434,13 @@ def play_single_video(video_path: str, overlay_word: str = "", duration: float =
                 continue
             
             show_frame(frame, overlay_word)
-            
-            # Release frame memory immediately
+
             del frame
-            
-            # Periodic garbage collection to prevent memory buildup
+
             if frame_count % gc_interval == 0:
                 import gc
                 gc.collect()
-            
-            # Check duration limit
+
             if duration and (time.time() - start_time) >= duration:
                 break
             
@@ -500,13 +499,12 @@ async def receive_results(ws):
             msg_type = data.get('type', '')
             
             if msg_type == 'connected':
-                print(f"✅ Connected: {data.get('message')}")
-                show_message(["Đã kết nối!", "", "Đang lắng nghe..."], (100, 255, 100))
+                print(f"\u2705 Connected: {data.get('message')}")
+                show_message(["\u0110\u00e3 k\u1ebft n\u1ed1i!", "", "\u0110ang l\u1eafng nghe..."], (100, 255, 100))
             
             elif msg_type == 'buffering':
                 progress = data.get('progress', 0)
                 print(f"   Buffering: {progress*100:.0f}%")
-                # Update LCD with progress bar could be added here
             
             elif msg_type == 'result':
                 transcript = data.get('transcript', '')
@@ -514,21 +512,22 @@ async def receive_results(ws):
                 words = data.get('words', [])
                 confidence = data.get('confidence', 0)
                 
-                print(f"\n📝 Transcript: {transcript}")
-                print(f"🤟 VSL Text: {vsl_text}")
-                print(f"📊 Confidence: {confidence:.2f}")
+                print(f"\n\ud83d\udcdd Transcript: {transcript}")
+                print(f"\ud83e\udd1f VSL Text: {vsl_text}")
+                print(f"\ud83d\udcca Confidence: {confidence:.2f}")
                 
                 if words:
-                    # Play video sequence with full transcript overlay
-                    # Mic keeps recording in background
                     play_video_sequence(words, transcript)
             
             elif msg_type == 'error':
-                print(f"❌ Error: {data.get('error')}")
-                show_message(["Lỗi!", data.get('error', '')[:20]], (255, 100, 100))
+                print(f"\u274c Error: {data.get('error')}")
+                show_message(["L\u1ed7i!", data.get('error', '')[:20]], (255, 100, 100))
+            
+            # Free message memory after processing
+            del data, message
     
     except Exception as e:
-        print(f"❌ Receive error: {e}")
+        print(f"\u274c Receive error: {e}")
 
 
 async def websocket_session():
