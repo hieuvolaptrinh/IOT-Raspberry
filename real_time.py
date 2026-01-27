@@ -451,8 +451,13 @@ def video_playback_worker():
                 continue
 
             words, transcript = task
+            
+            # 🔇 Chuyển sang PLAYING trước khi phát để block audio
             current_state = State.PLAYING
             stop_video = False
+            
+            # Delay nhỏ để đảm bảo audio stream đã block
+            time.sleep(0.1)
 
             for word in words:
                 if stop_video:
@@ -468,6 +473,7 @@ def video_playback_worker():
                                 break
                             play_single_video(str(lv), transcript, speed_multiplier=FINGERSPELL_SPEED)
 
+            # 🎤 Chuyển về RECORDING sau khi phát xong
             current_state = State.RECORDING
             stop_video = False
             video_queue.task_done()
@@ -666,8 +672,13 @@ async def stream_audio_to_server(ws):
             if not frame or len(frame) < frame_bytes:
                 break
 
-            speech_data = streamer.process_frame(frame)
+            # 🔇 BLOCK AUDIO khi đang phát video để tránh thu âm thanh từ loa
             is_video = (current_state == State.PLAYING)
+            if is_video:
+                await asyncio.sleep(0.001)
+                continue
+
+            speech_data = streamer.process_frame(frame)
 
             if speech_data:
                 if pending_queue.full():
