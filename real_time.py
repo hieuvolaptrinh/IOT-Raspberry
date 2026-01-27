@@ -42,33 +42,33 @@ else:
 WS_ENDPOINT = "/api/realtime/ws/vsl"
 
 VIDEO_SPEED = 2.0
-FINGERSPELL_SPEED = 2.0
+FINGERSPELL_SPEED = 2.5
 
 # ============ CONNECTION SETTINGS ============
 RECONNECT_DELAY = 3
 MAX_RECONNECT_ATTEMPTS = 5
 
-# ============ VAD SETTINGS (OPTIMIZED) ============
+# ============ VAD SETTINGS (OPTIMIZED FOR BETTER RECORDING) ============
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FRAME_DURATION_MS = 20          # WebRTC VAD frame size (10, 20, or 30ms)
 FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 320 samples at 16kHz
 
-# Speech detection thresholds
-PREROLL_FRAMES = 12             # 240ms pre-roll buffer (keep before speech start)
-HANGOVER_FRAMES = 35            # 700ms hangover (keep after speech end)
-MIN_SPEECH_FRAMES = 5           # Minimum 100ms speech to send
+# Speech detection thresholds (RELAXED for better capture)
+PREROLL_FRAMES = 15             # 300ms pre-roll buffer (tăng từ 240ms)
+HANGOVER_FRAMES = 40            # 800ms hangover (tăng từ 700ms)
+MIN_SPEECH_FRAMES = 3           # Minimum 60ms speech (giảm từ 100ms)
 
-# Batch sending (reduce WebSocket overhead)
-SEND_INTERVAL_NORMAL = 0.12     # 120ms batch while recording
-SEND_INTERVAL_VIDEO = 0.24      # 240ms batch while video playing
+# Batch sending (FASTER for real-time feel)
+SEND_INTERVAL_NORMAL = 0.08     # 80ms batch (giảm từ 120ms)
+SEND_INTERVAL_VIDEO = 0.16      # 160ms batch (giảm từ 240ms)
 
-# RMS backup threshold (reject wind/fan noise)
-MIN_RMS_THRESHOLD = 300
-MAX_RMS_THRESHOLD = 25000       # Reject clipping/too loud
+# RMS backup threshold (LOWER for sensitive recording)
+MIN_RMS_THRESHOLD = 100         # Giảm từ 300 → ghi nhạy hơn
+MAX_RMS_THRESHOLD = 28000       # Tăng từ 25000 → chấp nhận âm to hơn
 
-# Queue limit to prevent memory overflow
-MAX_PENDING_BATCHES = 3
+# Queue limit (INCREASED to prevent data loss)
+MAX_PENDING_BATCHES = 5         # Tăng từ 3 → 5
 
 # ============ DISPLAY SETTINGS ============
 MIRROR_MODE = True
@@ -499,13 +499,13 @@ class VADAudioStreamer:
     
     def update_noise_floor(self, rms: float, is_speech: bool):
         """Update adaptive noise floor from silence frames."""
-        if not is_speech and rms > 50 and rms < 2000:
+        if not is_speech and rms > 30 and rms < 1500:  # Giảm upper bound từ 2000 → 1500
             self.noise_samples.append(rms)
             if len(self.noise_samples) >= 10:
-                # Noise floor = 1.5x median of recent silence
+                # Noise floor = 1.2x median (giảm từ 1.5x để nhạy hơn)
                 sorted_samples = sorted(self.noise_samples)
                 median = sorted_samples[len(sorted_samples) // 2]
-                self.noise_floor = max(MIN_RMS_THRESHOLD * 0.5, min(median * 1.5, MIN_RMS_THRESHOLD * 2))
+                self.noise_floor = max(MIN_RMS_THRESHOLD * 0.3, min(median * 1.2, MIN_RMS_THRESHOLD * 1.5))
     
     def process_frame(self, frame_bytes: bytes) -> bytes:
         """
@@ -527,8 +527,9 @@ class VADAudioStreamer:
         else:
             is_speech = rms > self.noise_floor
         
-        # RMS filter - reject obvious noise
-        if rms < self.noise_floor * 0.3 or rms > MAX_RMS_THRESHOLD:
+        # RMS filter - MINIMAL (chỉ lọc nhiễu rõ ràng)
+        # Chỉ reject nếu quá yên lặng hoặc quá to (clipping)
+        if rms < 50 or rms > MAX_RMS_THRESHOLD:
             self.noise_rejected += 1
             is_speech = False
             self.update_noise_floor(rms, False)
@@ -536,6 +537,10 @@ class VADAudioStreamer:
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
             return b''
+        
+        # Log khi phát hiện speech
+        if is_speech and not self.in_speech:
+            print(f"🎤 Speech START (RMS: {rms:.0f}, noise_floor: {self.noise_floor:.0f})")
         
         # Update noise floor during silence
         if not is_speech:
