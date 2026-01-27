@@ -63,13 +63,15 @@ MIN_SPEECH_FRAMES = 2                  # 60ms
 SEND_INTERVAL_NORMAL = 0.06
 SEND_INTERVAL_VIDEO = 0.12
 
-MIN_RMS_THRESHOLD = 60                 # nhạy hơn
+MIN_RMS_THRESHOLD = 100                # nhạy hơn
 MAX_RMS_THRESHOLD = 32000
 
-MAX_PENDING_BATCHES = 10
+MAX_PENDING_BATCHES = 5
 
 # ============ DISPLAY SETTINGS ============
 MIRROR_MODE = True
+TARGET_LCD_FPS = 18  # Giới hạn LCD refresh rate
+LCD_FRAME_TIME = 1.0 / TARGET_LCD_FPS  # ~55ms per frame
 
 # ============ GPIO PINS ============
 BUTTON_PIN = 17
@@ -207,29 +209,55 @@ def init_lcd():
 _display_buffer = np.empty((240, 240, 2), dtype=np.uint8)
 _rgb565_buffer = np.empty((240, 240), dtype=np.uint16)
 
+# ============ OVERLAY CACHE ============
+_overlay_cache = {}  # {text: bgr_overlay_array}
+_overlay_cache_max = 50
+
+def _create_text_overlay(text: str) -> np.ndarray:
+    """Tạo overlay text dưới dạng BGR numpy array (240x40)."""
+    pil_img = Image.new('RGB', (240, 40), (0, 0, 0))
+    draw = ImageDraw.Draw(pil_img)
+    
+    text = text[:30]
+    try:
+        bbox = draw.textbbox((0, 0), text, font=FONT_VN)
+        text_width = bbox[2] - bbox[0]
+    except:
+        text_width = len(text) * 10
+    
+    x = max(5, (240 - text_width) // 2)
+    draw.text((x, 10), text, font=FONT_VN, fill=(255, 255, 255))
+    
+    # Convert to BGR numpy array
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+def _get_cached_overlay(text: str) -> np.ndarray:
+    """Lấy hoặc tạo cached overlay."""
+    global _overlay_cache
+    
+    if text not in _overlay_cache:
+        # Clear cache nếu quá lớn
+        if len(_overlay_cache) >= _overlay_cache_max:
+            _overlay_cache.clear()
+        
+        _overlay_cache[text] = _create_text_overlay(text)
+    
+    return _overlay_cache[text]
+
 def show_frame(frame, overlay_text=None):
     global _display_buffer, _rgb565_buffer
 
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
 
+    # Composite overlay bằng numpy (nhanh hơn PIL)
     if overlay_text:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
-        draw = ImageDraw.Draw(pil_img)
-        draw.rectangle([(0, 200), (240, 240)], fill=(0, 0, 0))
-        text = overlay_text[:30]
-        try:
-            bbox = draw.textbbox((0, 0), text, font=FONT_VN)
-            text_width = bbox[2] - bbox[0]
-        except:
-            text_width = len(text) * 10
-        x = max(5, (240 - text_width) // 2)
-        draw.text((x, 210), text, font=FONT_VN, fill=(255, 255, 255))
-        frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        overlay = _get_cached_overlay(overlay_text)
+        frame[200:240, :] = overlay  # Dán overlay vào bottom 40px
 
     if MIRROR_MODE:
         frame = cv2.flip(frame, 1)
 
+    # Convert BGR to RGB565
     np.add(
         np.add(
             np.left_shift(frame[:, :, 2].astype(np.uint16) >> 3, 11),
@@ -356,6 +384,10 @@ video_queue = queue.Queue()
 video_thread_running = True
 
 def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0, speed_multiplier: float = 1.0):
+    """
+    Play video với frame skipping thông minh để đạt TARGET_LCD_FPS.
+    Video vẫn chạy đúng tốc độ (speed_multiplier), nhưng chỉ hiển thị mỗi N frame.
+    """
     global stop_video
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -370,7 +402,19 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
         cap.release()
         return
 
-    frame_delay = (1.0 / fps if fps > 0 else 0.04) / speed_multiplier
+    # Tính toán frame skip
+    effective_fps = fps * speed_multiplier  # FPS sau khi tăng tốc
+    
+    # Nếu effective_fps > TARGET_LCD_FPS, skip frame
+    if effective_fps > TARGET_LCD_FPS:
+        frame_skip = int(effective_fps / TARGET_LCD_FPS)
+        display_interval = LCD_FRAME_TIME
+    else:
+        frame_skip = 1
+        display_interval = 1.0 / effective_fps
+    
+    frame_count = 0
+    last_display_time = time.time()
     start_time = time.time()
 
     try:
@@ -378,10 +422,23 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
             ret, frame = cap.read()
             if not ret:
                 break
-            show_frame(frame, overlay_word)
+            
+            frame_count += 1
+            
+            # Chỉ hiển thị mỗi N frame
+            if frame_count % frame_skip == 0:
+                show_frame(frame, overlay_word)
+                
+                # Throttle LCD refresh
+                elapsed = time.time() - last_display_time
+                if elapsed < display_interval:
+                    time.sleep(display_interval - elapsed)
+                last_display_time = time.time()
+            
+            # Check timeout
             if time.time() - start_time >= max_duration:
                 break
-            time.sleep(frame_delay)
+                
     finally:
         cap.release()
 
