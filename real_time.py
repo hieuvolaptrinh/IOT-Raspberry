@@ -45,7 +45,7 @@ SKIP_FRAMES = 1  # Skip every N frames for faster playback (1 = no skip)
 # 0.5 = Slower (2x longer, easier to see)
 # 2.0 = Faster (2x shorter, quicker but harder to see)
 # Recommended: 0.8-1.5 for best experience
-VIDEO_SPEED = 1.0  # General video playback speed
+VIDEO_SPEED = 2.0  # General video playback speed
 FINGERSPELL_SPEED = 1.5
 
 
