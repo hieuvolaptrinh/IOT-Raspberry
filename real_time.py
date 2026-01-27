@@ -13,8 +13,8 @@ import threading
 import re
 import struct
 import queue
+import gc
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
@@ -41,34 +41,37 @@ else:
 
 WS_ENDPOINT = "/api/realtime/ws/vsl"
 
-VIDEO_SPEED = 2.0
-FINGERSPELL_SPEED = 2.5
+# ============ VIDEO SETTINGS (Pi Zero W Optimized) ============
+VIDEO_SPEED = 1.8
+FINGERSPELL_SPEED = 2.2
+TARGET_FPS = 15
+ENABLE_TEXT_OVERLAY = False
 
 # ============ CONNECTION SETTINGS ============
 RECONNECT_DELAY = 3
 MAX_RECONNECT_ATTEMPTS = 5
 
-# ============ VAD SETTINGS (OPTIMIZED FOR BETTER RECORDING) ============
+# ============ VAD SETTINGS ============
 SAMPLE_RATE = 16000
 CHANNELS = 1
-FRAME_DURATION_MS = 20          # WebRTC VAD frame size (10, 20, or 30ms)
-FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 320 samples at 16kHz
+FRAME_DURATION_MS = 20
+FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000
 
-# Speech detection thresholds (RELAXED for better capture)
-PREROLL_FRAMES = 15             # 300ms pre-roll buffer (tăng từ 240ms)
-HANGOVER_FRAMES = 40            # 800ms hangover (tăng từ 700ms)
-MIN_SPEECH_FRAMES = 3           # Minimum 60ms speech (giảm từ 100ms)
+# Speech detection thresholds
+PREROLL_FRAMES = 15
+HANGOVER_FRAMES = 40
+MIN_SPEECH_FRAMES = 3
 
-# Batch sending (FASTER for real-time feel)
-SEND_INTERVAL_NORMAL = 0.08     # 80ms batch (giảm từ 120ms)
-SEND_INTERVAL_VIDEO = 0.16      # 160ms batch (giảm từ 240ms)
+# Batch sending
+SEND_INTERVAL_NORMAL = 0.08
+SEND_INTERVAL_VIDEO = 0.16
 
-# RMS backup threshold (LOWER for sensitive recording)
-MIN_RMS_THRESHOLD = 100         # Giảm từ 300 → ghi nhạy hơn
-MAX_RMS_THRESHOLD = 28000       # Tăng từ 25000 → chấp nhận âm to hơn
+# RMS backup threshold
+MIN_RMS_THRESHOLD = 100
+MAX_RMS_THRESHOLD = 28000
 
-# Queue limit (INCREASED to prevent data loss)
-MAX_PENDING_BATCHES = 5         # Tăng từ 3 → 5
+# Queue limit
+MAX_PENDING_BATCHES = 5
 
 # ============ DISPLAY SETTINGS ============
 MIRROR_MODE = True
@@ -90,7 +93,6 @@ class State:
     IDLE = 0
     CONNECTING = 1
     RECORDING = 2
-    PROCESSING = 3
     PLAYING = 4
 
 current_state = State.IDLE
@@ -125,12 +127,8 @@ AUDIO_DEVICE = get_usb_audio_device()
 # ============ FONT ============
 try:
     FONT_VN = ImageFont.truetype(FONT_PATH, 22)
-    FONT_SMALL = ImageFont.truetype(FONT_PATH, 16)
-    FONT_LARGE = ImageFont.truetype(FONT_PATH, 28)
 except:
     FONT_VN = ImageFont.load_default()
-    FONT_SMALL = ImageFont.load_default()
-    FONT_LARGE = ImageFont.load_default()
 
 
 # ============ GPIO + SPI SETUP ============
@@ -169,7 +167,7 @@ def data(d):
 
 def data_bulk(d):
     GPIO.output(DC_PIN, GPIO.HIGH)
-    CHUNK = 32768
+    CHUNK = 65536
     d_bytes = bytes(d) if not isinstance(d, bytes) else d
     for i in range(0, len(d_bytes), CHUNK):
         spi.writebytes2(d_bytes[i:i+CHUNK])
@@ -211,7 +209,8 @@ def show_frame(frame, overlay_text=None):
     
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
     
-    if overlay_text:
+    # Only add text overlay if enabled AND text provided
+    if overlay_text and ENABLE_TEXT_OVERLAY:
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(frame_rgb)
         draw = ImageDraw.Draw(pil_img)
@@ -229,12 +228,17 @@ def show_frame(frame, overlay_text=None):
     if MIRROR_MODE:
         frame = cv2.flip(frame, 1)
     
-    np.add(
-        np.add(
-            np.left_shift(frame[:, :, 2].astype(np.uint16) >> 3, 11),
-            np.left_shift(frame[:, :, 1].astype(np.uint16) >> 2, 5)
+    # Optimized RGB565 conversion
+    b = frame[:, :, 0].astype(np.uint16)
+    g = frame[:, :, 1].astype(np.uint16)
+    r = frame[:, :, 2].astype(np.uint16)
+    
+    np.bitwise_or(
+        np.bitwise_or(
+            np.left_shift(r >> 3, 11, out=_rgb565_buffer),
+            np.left_shift(g >> 2, 5)
         ),
-        frame[:, :, 0].astype(np.uint16) >> 3,
+        b >> 3,
         out=_rgb565_buffer
     )
     
@@ -417,11 +421,15 @@ video_thread.start()
 def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0, speed_multiplier: float = 1.0):
     global stop_video
     
+    gc.collect()
+    
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return
     
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total_frames / fps if fps > 0 else 0
@@ -430,59 +438,80 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
         cap.release()
         return
     
+    target_frame_time = (1.0 / TARGET_FPS) / speed_multiplier
     frame_delay = (1.0 / fps if fps > 0 else 0.04) / speed_multiplier
+    
     start_time = time.time()
+    frame_count = 0
+    skipped_frames = 0
+    last_frame_time = start_time
+    
+    display_text = overlay_word if ENABLE_TEXT_OVERLAY else None
     
     try:
         while not stop_video:
+            current_time = time.time()
+            elapsed = current_time - start_time
+            
+            if elapsed >= max_duration:
+                break
+            
+            expected_frame = int(elapsed * TARGET_FPS * speed_multiplier)
+            if frame_count < expected_frame - 1:
+                ret = cap.grab()
+                if not ret:
+                    break
+                skipped_frames += 1
+                frame_count += 1
+                continue
+            
             ret, frame = cap.read()
             if not ret:
                 break
             
-            show_frame(frame, overlay_word)
+            show_frame(frame, display_text)
+            frame_count += 1
             
-            if time.time() - start_time >= max_duration:
-                break
+            frame_time = time.time() - last_frame_time
+            sleep_time = max(0, target_frame_time - frame_time)
             
-            time.sleep(frame_delay)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            
+            last_frame_time = time.time()
+            
     finally:
         cap.release()
+        gc.collect()
+        
+        if skipped_frames > 0:
+            print(f"📹 Video: {frame_count} frames, {skipped_frames} skipped")
 
 
-# ============ VAD-BASED AUDIO STREAMING ============
 class VADAudioStreamer:
     """
     WebRTC VAD-based audio streamer with pre-roll, hangover, and batch sending.
     Only sends speech segments to reduce bandwidth by 70-90%.
     """
     
-    # Max speech segment duration to prevent memory overflow
     MAX_SPEECH_SECONDS = 8.0
     
     def __init__(self):
-        # Initialize VAD (mode 3 = aggressive)
         if VAD_AVAILABLE:
             self.vad = webrtcvad.Vad(3)
         else:
             self.vad = None
         
-        # Pre-roll buffer (keep N frames before speech detected)
         self.preroll_buffer = deque(maxlen=PREROLL_FRAMES)
-        
-        # Current speech segment buffer
         self.speech_buffer = bytearray()
-        
-        # State
         self.in_speech = False
         self.hangover_counter = 0
         self.speech_frame_count = 0
-        
-        # Batch timing
         self.last_send_time = time.time()
         
         # Adaptive noise floor
         self.noise_floor = MIN_RMS_THRESHOLD
-        self.noise_samples = deque(maxlen=50)  # ~1 second of samples
+        self.noise_samples = deque(maxlen=50)
         
         # Stats
         self.frames_processed = 0
@@ -499,10 +528,9 @@ class VADAudioStreamer:
     
     def update_noise_floor(self, rms: float, is_speech: bool):
         """Update adaptive noise floor from silence frames."""
-        if not is_speech and rms > 30 and rms < 1500:  # Giảm upper bound từ 2000 → 1500
+        if not is_speech and rms > 30 and rms < 1500:
             self.noise_samples.append(rms)
             if len(self.noise_samples) >= 10:
-                # Noise floor = 1.2x median (giảm từ 1.5x để nhạy hơn)
                 sorted_samples = sorted(self.noise_samples)
                 median = sorted_samples[len(sorted_samples) // 2]
                 self.noise_floor = max(MIN_RMS_THRESHOLD * 0.3, min(median * 1.2, MIN_RMS_THRESHOLD * 1.5))
@@ -514,10 +542,14 @@ class VADAudioStreamer:
         """
         self.frames_processed += 1
         
-        # Calculate RMS
+        # Periodic logging every 2.5 seconds
+        if self.frames_processed % 125 == 0:
+            duration = self.frames_processed * FRAME_DURATION_MS / 1000.0
+            print(f"🎤 Recording: {duration:.1f}s | Frames: {self.frames_processed} | "
+                  f"Sent: {self.frames_sent} | Noise floor: {self.noise_floor:.0f}")
+        
         rms = self.calculate_rms(frame_bytes)
         
-        # Initial VAD check
         is_speech = False
         if self.vad:
             try:
@@ -527,58 +559,46 @@ class VADAudioStreamer:
         else:
             is_speech = rms > self.noise_floor
         
-        # RMS filter - MINIMAL (chỉ lọc nhiễu rõ ràng)
-        # Chỉ reject nếu quá yên lặng hoặc quá to (clipping)
+        # RMS filter - only reject obvious noise
         if rms < 50 or rms > MAX_RMS_THRESHOLD:
             self.noise_rejected += 1
             is_speech = False
             self.update_noise_floor(rms, False)
-            # Still add to preroll for context
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
             return b''
         
-        # Log khi phát hiện speech
         if is_speech and not self.in_speech:
             print(f"🎤 Speech START (RMS: {rms:.0f}, noise_floor: {self.noise_floor:.0f})")
         
-        # Update noise floor during silence
         if not is_speech:
             self.update_noise_floor(rms, False)
         
         if is_speech:
             if not self.in_speech:
-                # Speech start - include pre-roll
                 self.in_speech = True
                 self.speech_frame_count = 0
                 
-                # Add pre-roll frames
                 for preroll_frame in self.preroll_buffer:
                     self.speech_buffer.extend(preroll_frame)
                 self.preroll_buffer.clear()
             
-            # Add current frame
             self.speech_buffer.extend(frame_bytes)
             self.speech_frame_count += 1
             self.hangover_counter = HANGOVER_FRAMES
             
-            # Check max duration - force flush if too long
             max_frames = int(self.MAX_SPEECH_SECONDS * 1000 / FRAME_DURATION_MS)
             if self.speech_frame_count >= max_frames:
                 return self._flush_speech_buffer()
             
         else:
-            # Silence/noise
             if self.in_speech:
-                # In hangover period - keep adding
                 if self.hangover_counter > 0:
                     self.speech_buffer.extend(frame_bytes)
                     self.hangover_counter -= 1
                 else:
-                    # Speech ended - flush if long enough
                     return self._flush_speech_buffer()
             else:
-                # Add to pre-roll buffer
                 self.preroll_buffer.append(frame_bytes)
         
         return b''
@@ -588,6 +608,9 @@ class VADAudioStreamer:
         self.in_speech = False
         
         if self.speech_frame_count >= MIN_SPEECH_FRAMES:
+            duration = self.speech_frame_count * FRAME_DURATION_MS / 1000.0
+            print(f"🎤 Speech END (duration: {duration:.2f}s, frames: {self.speech_frame_count})")
+            
             result = bytes(self.speech_buffer)
             self.frames_sent += self.speech_frame_count
             self.speech_buffer = bytearray()
@@ -637,11 +660,10 @@ async def stream_audio_to_server(ws):
     global stop_streaming, current_state
     
     streamer = VADAudioStreamer()
-    frame_bytes = FRAME_SIZE * 2  # 16-bit samples
+    frame_bytes = FRAME_SIZE * 2
     
     print(f"🎤 Starting VAD audio stream (frame={FRAME_DURATION_MS}ms)")
     
-    # Start arecord
     process = subprocess.Popen([
         'arecord', '-D', AUDIO_DEVICE,
         '-f', 'S16_LE', '-r', str(SAMPLE_RATE),
@@ -652,28 +674,22 @@ async def stream_audio_to_server(ws):
     
     try:
         while not stop_streaming:
-            # Read one frame
             frame = process.stdout.read(frame_bytes)
             if not frame or len(frame) < frame_bytes:
                 break
             
-            # Process through VAD - returns speech data when segment completes
             speech_data = streamer.process_frame(frame)
-            
-            # Check if we have data to send
             is_video = (current_state == State.PLAYING)
             
             if speech_data and len(speech_data) > 0:
-                # Queue for sending (with limit to prevent overflow)
                 if pending_queue.full():
                     try:
-                        pending_queue.get_nowait()  # Drop oldest
+                        pending_queue.get_nowait()
                     except:
                         pass
                 pending_queue.put(speech_data)
                 streamer.mark_batch_sent()
             
-            # Send from queue when interval reached
             if streamer.should_send_batch(is_video):
                 try:
                     while not pending_queue.empty():
@@ -688,7 +704,6 @@ async def stream_audio_to_server(ws):
         process.terminate()
         process.wait()
         
-        # Send flush command
         try:
             await ws.send(json.dumps({'type': 'flush'}))
         except:
