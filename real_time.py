@@ -803,23 +803,51 @@ def handle_button():
 
     print(f"🔘 Button! State: {current_state}")
 
+    # Nếu đang phát video -> dừng cả ghi âm và phát video
     if current_state == State.PLAYING:
+        print("⏹️ Stopping video and recording...")
         stop_video = True
+        stop_streaming = True
+        is_recording = False
+        current_state = State.IDLE
+        
+        # Clear video queue
+        while not video_queue.empty():
+            try:
+                video_queue.get_nowait()
+                video_queue.task_done()
+            except:
+                break
+        
+        show_message(["Đã dừng", "", "Nhấn nút để", "ghi lại"], (100, 255, 100))
         return
 
+    # Nếu chưa ghi âm -> bắt đầu ghi âm
     if not is_recording:
         is_recording = True
         stop_streaming = False
+        stop_video = False
         current_state = State.CONNECTING
 
         show_message(["🔴 GHI ÂM", "", "Đang kết nối...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
 
         ws_thread = threading.Thread(target=start_websocket_thread, daemon=True)
         ws_thread.start()
+    # Nếu đang ghi âm -> dừng ghi âm
     else:
         is_recording = False
         stop_streaming = True
+        stop_video = True
         current_state = State.IDLE
+        
+        # Clear video queue
+        while not video_queue.empty():
+            try:
+                video_queue.get_nowait()
+                video_queue.task_done()
+            except:
+                break
+        
         show_message(["Đã dừng", "", "Nhấn nút để", "ghi lại"], (100, 255, 100))
 
 # ============ MAIN ============
