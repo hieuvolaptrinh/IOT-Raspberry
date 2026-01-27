@@ -11,16 +11,27 @@ import websockets
 import json
 import threading
 import re
+import struct
+import queue
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
+# WebRTC VAD for speech detection
+try:
+    import webrtcvad
+    VAD_AVAILABLE = True
+except ImportError:
+    VAD_AVAILABLE = False
+    print("⚠️ webrtcvad not installed. Install: pip install webrtcvad")
+
 # ============ LOAD .ENV ============
 load_dotenv()
 _api_url = os.getenv("API_URL", "ws://172.20.10.3:8000")
 
-# Auto-convert http:// to ws:// and https:// to wss://
+# Auto-convert http:// to ws://
 if _api_url.startswith("http://"):
     API_URL = _api_url.replace("http://", "ws://", 1)
 elif _api_url.startswith("https://"):
@@ -30,28 +41,41 @@ else:
 
 WS_ENDPOINT = "/api/realtime/ws/vsl"
 
+VIDEO_SPEED = 2.0
+FINGERSPELL_SPEED = 2.0
+
 # ============ CONNECTION SETTINGS ============
-RECONNECT_DELAY = 3  # Seconds between reconnect attempts
+RECONNECT_DELAY = 3
 MAX_RECONNECT_ATTEMPTS = 5
-SILENCE_THRESHOLD = 500  # RMS threshold for silence detection
-SILENCE_DURATION = 1.5  # Seconds of silence before flushing
+
+# ============ VAD SETTINGS (OPTIMIZED) ============
+SAMPLE_RATE = 16000
+CHANNELS = 1
+FRAME_DURATION_MS = 20          # WebRTC VAD frame size (10, 20, or 30ms)
+FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 320 samples at 16kHz
+
+# Speech detection thresholds
+PREROLL_FRAMES = 12             # 240ms pre-roll buffer (keep before speech start)
+HANGOVER_FRAMES = 35            # 700ms hangover (keep after speech end)
+MIN_SPEECH_FRAMES = 5           # Minimum 100ms speech to send
+
+# Batch sending (reduce WebSocket overhead)
+SEND_INTERVAL_NORMAL = 0.12     # 120ms batch while recording
+SEND_INTERVAL_VIDEO = 0.24      # 240ms batch while video playing
+
+# RMS backup threshold (reject wind/fan noise)
+MIN_RMS_THRESHOLD = 300
+MAX_RMS_THRESHOLD = 25000       # Reject clipping/too loud
+
+# Queue limit to prevent memory overflow
+MAX_PENDING_BATCHES = 3
 
 # ============ DISPLAY SETTINGS ============
-MIRROR_MODE = True  # Set True for VR glasses (flip horizontal)
-SKIP_FRAMES = 1  # Skip every N frames for faster playback (1 = no skip)
-
-# Video playback speed control
-# 1.0 = Normal speed (play full video)
-# 0.5 = Slower (2x longer, easier to see)
-# 2.0 = Faster (2x shorter, quicker but harder to see)
-# Recommended: 0.8-1.5 for best experience
-VIDEO_SPEED = 2.0  # General video playback speed
-FINGERSPELL_SPEED = 1.5
-
+MIRROR_MODE = True
 
 
 # ============ GPIO PINS ============
-BUTTON_PIN = 17  # Pin 11
+BUTTON_PIN = 17
 DC_PIN = 24
 RST_PIN = 25
 BL_PIN = 18
@@ -61,53 +85,21 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_DIR = os.path.join(SCRIPT_DIR, "video")
 FONT_PATH = os.path.join(SCRIPT_DIR, "SVN-Arial Regular.ttf")
 
-# ============ AUDIO SETTINGS ============
-SAMPLE_RATE = 16000  # Whisper expects 16kHz
-CHANNELS = 1
-CHUNK_SIZE = 8000  # 0.5 seconds of audio at 16kHz
-
-# Client-side filtering (reduce bandwidth, save server resources)
-ENABLE_CLIENT_FILTER = True  # Set False to disable client-side filtering
-CLIENT_MIN_RMS = 200  # Lower than server threshold (send borderline audio to server)
-
-
-def calculate_chunk_rms(audio_bytes: bytes) -> float:
-    """
-    Calculate RMS (Root Mean Square) of audio chunk for noise detection.
-    Quick check before sending to server to reduce bandwidth.
-    """
-    import struct
-    
-    if len(audio_bytes) < 2:
-        return 0.0
-    
-    # Unpack 16-bit signed integers
-    num_samples = len(audio_bytes) // 2
-    samples = struct.unpack(f'<{num_samples}h', audio_bytes)
-    
-    # Calculate RMS
-    sum_squares = sum(s * s for s in samples)
-    rms = (sum_squares / num_samples) ** 0.5 if num_samples > 0 else 0
-    
-    return rms
-
-
 # ============ STATE ============
 class State:
     IDLE = 0
     CONNECTING = 1
-    RECORDING = 2  # Actively recording and sending audio
+    RECORDING = 2
     PROCESSING = 3
     PLAYING = 4
 
 current_state = State.IDLE
-is_recording = False  # Toggle for recording mode
+is_recording = False
 stop_streaming = False
 stop_video = False
 websocket_connected = False
 reconnect_count = 0
-last_audio_time = 0  # For silence detection
-ws_thread = None  # WebSocket thread reference
+ws_thread = None
 
 
 # ============ AUDIO DEVICE ============
@@ -115,22 +107,15 @@ def get_usb_audio_device():
     """Auto-detect USB audio device."""
     try:
         result = subprocess.run(['arecord', '-l'], capture_output=True, text=True)
-        lines = result.stdout.split('\n')
-        
-        for line in lines:
+        for line in result.stdout.split('\n'):
             if 'card' in line.lower() and ('usb' in line.lower() or 'pnp' in line.lower()):
                 match = re.search(r'card (\d+):', line)
                 if match:
-                    card_num = match.group(1)
-                    device = f"plughw:{card_num},0"
-                    print(f"🎤 Found USB Audio: {line.strip()}")
-                    print(f"   → Using: {device}")
+                    device = f"plughw:{match.group(1)},0"
+                    print(f"🎤 USB Audio: {device}")
                     return device
-        
-        print("⚠️ USB Audio not found, using default: plughw:0,0")
         return "plughw:0,0"
-    except Exception as e:
-        print(f"⚠️ Error finding audio device: {e}")
+    except Exception:
         return "plughw:0,0"
 
 
@@ -139,14 +124,13 @@ AUDIO_DEVICE = get_usb_audio_device()
 
 # ============ FONT ============
 try:
-    FONT_VN = ImageFont.truetype(FONT_PATH, 22)  # Bigger font
+    FONT_VN = ImageFont.truetype(FONT_PATH, 22)
     FONT_SMALL = ImageFont.truetype(FONT_PATH, 16)
-    FONT_LARGE = ImageFont.truetype(FONT_PATH, 28)  # For titles
+    FONT_LARGE = ImageFont.truetype(FONT_PATH, 28)
 except:
     FONT_VN = ImageFont.load_default()
     FONT_SMALL = ImageFont.load_default()
     FONT_LARGE = ImageFont.load_default()
-    print("⚠️ Font not found, using default")
 
 
 # ============ GPIO + SPI SETUP ============
@@ -184,19 +168,11 @@ def data(d):
 
 
 def data_bulk(d):
-    """Send bulk data to LCD - ULTRA OPTIMIZED with writebytes2."""
     GPIO.output(DC_PIN, GPIO.HIGH)
-    # writebytes2 is faster than xfer2 for large data (no return buffer)
-    # Use larger chunks for fewer calls
-    CHUNK_SIZE = 32768  # 32KB chunks (was 4KB)
-    if isinstance(d, bytes):
-        for i in range(0, len(d), CHUNK_SIZE):
-            spi.writebytes2(d[i:i+CHUNK_SIZE])
-    else:
-        # Convert to bytes first if it's a list
-        d_bytes = bytes(d)
-        for i in range(0, len(d_bytes), CHUNK_SIZE):
-            spi.writebytes2(d_bytes[i:i+CHUNK_SIZE])
+    CHUNK = 32768
+    d_bytes = bytes(d) if not isinstance(d, bytes) else d
+    for i in range(0, len(d_bytes), CHUNK):
+        spi.writebytes2(d_bytes[i:i+CHUNK])
 
 
 def init_lcd():
@@ -225,29 +201,21 @@ def init_lcd():
     cmd(0x29); time.sleep(0.12)
 
 
-# Pre-allocate display buffer for performance
 _display_buffer = np.empty((240, 240, 2), dtype=np.uint8)
 _rgb565_buffer = np.empty((240, 240), dtype=np.uint16)
 
 
 def show_frame(frame, overlay_text=None):
-    """Display a frame on LCD - supports Vietnamese font and mirror mode."""
+    """Display frame on LCD with optional text overlay."""
     global _display_buffer, _rgb565_buffer
     
-    # Resize with fastest interpolation
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
     
-    # Add text overlay BEFORE mirroring (so text is mirrored too)
     if overlay_text:
-        # Convert to PIL for Vietnamese font support
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(frame_rgb)
         draw = ImageDraw.Draw(pil_img)
-        
-        # Black bar at bottom
         draw.rectangle([(0, 200), (240, 240)], fill=(0, 0, 0))
-        
-        # White text, centered
         text = overlay_text[:30]
         try:
             bbox = draw.textbbox((0, 0), text, font=FONT_VN)
@@ -256,14 +224,11 @@ def show_frame(frame, overlay_text=None):
             text_width = len(text) * 10
         x = max(5, (240 - text_width) // 2)
         draw.text((x, 210), text, font=FONT_VN, fill=(255, 255, 255))
-        
         frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     
-    # Mirror for VR glasses AFTER adding text (so text is mirrored too)
     if MIRROR_MODE:
         frame = cv2.flip(frame, 1)
     
-    # OPTIMIZED RGB565 conversion
     np.add(
         np.add(
             np.left_shift(frame[:, :, 2].astype(np.uint16) >> 3, 11),
@@ -273,11 +238,9 @@ def show_frame(frame, overlay_text=None):
         out=_rgb565_buffer
     )
     
-    # Split into high/low bytes
     _display_buffer[:, :, 0] = (_rgb565_buffer >> 8).astype(np.uint8)
     _display_buffer[:, :, 1] = (_rgb565_buffer & 0xFF).astype(np.uint8)
     
-    # Send to LCD
     cmd(0x2A); data([0, 0, 0, 239])
     cmd(0x2B); data([0, 0, 0, 239])
     cmd(0x2C)
@@ -285,18 +248,17 @@ def show_frame(frame, overlay_text=None):
 
 
 def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0)):
-    """Display text message on LCD with white/bright colors."""
+    """Display text message on LCD."""
     pil_img = Image.new('RGB', (240, 240), bg_color)
     draw = ImageDraw.Draw(pil_img)
     
     if isinstance(lines, str):
         lines = lines.split('\n')
     
-    total_height = len(lines) * 35  # Increased line height
+    total_height = len(lines) * 35
     start_y = (240 - total_height) // 2
     
     for i, line in enumerate(lines):
-        # Get text width for centering
         bbox = draw.textbbox((0, 0), line, font=FONT_VN)
         text_width = bbox[2] - bbox[0]
         x = max(5, (240 - text_width) // 2)
@@ -305,19 +267,13 @@ def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0)):
     
     frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     show_frame(frame)
-    
-    # Free memory
-    del pil_img, draw, frame
 
 
 # ============ VIDEO MAPPER ============
 class VideoMapper:
     """Map words to local video files."""
     
-    # Windows reserved names
     RESERVED_NAMES = {'con', 'prn', 'aux', 'nul', 'com1', 'com2', 'lpt1'}
-    
-    # Vietnamese tone marks → base letter
     TONE_MAP = {
         'à': 'a', 'á': 'a', 'ả': 'a', 'ã': 'a', 'ạ': 'a',
         'ă': 'ă', 'ằ': 'ă', 'ắ': 'ă', 'ẳ': 'ă', 'ẵ': 'ă', 'ặ': 'ă',
@@ -337,141 +293,85 @@ class VideoMapper:
         self.video_dir = Path(video_dir)
         self.video_cache = {}
         self._scan_videos()
-        print(f"📹 VideoMapper: {len(self.video_cache)} videos loaded")
+        print(f"📹 VideoMapper: {len(self.video_cache)} videos")
     
     def _scan_videos(self):
-        """Scan and cache all video files."""
         if not self.video_dir.exists():
-            print(f"⚠️ Video dir not found: {self.video_dir}")
             return
-        
-        for f in self.video_dir.glob("*.mp4"):
-            key = f.stem.lower()
-            self.video_cache[key] = f
-        
-        for f in self.video_dir.glob("*.webm"):
-            key = f.stem.lower()
-            if key not in self.video_cache:
-                self.video_cache[key] = f
+        for ext in ['*.mp4', '*.webm']:
+            for f in self.video_dir.glob(ext):
+                self.video_cache[f.stem.lower()] = f
     
     def normalize_for_pronunciation(self, text: str) -> str:
-        """Remove tone marks for fuzzy matching."""
-        result = []
-        for char in text.lower():
-            result.append(self.TONE_MAP.get(char, char))
-        return ''.join(result)
+        return ''.join(self.TONE_MAP.get(c, c) for c in text.lower())
     
     def normalize_word(self, word: str) -> str:
-        """
-        Normalize word for matching: lowercase, remove punctuation.
-        
-        Examples:
-            "Tôi" -> "tôi"
-            "học!" -> "học"
-            "Xin chào," -> "xin chào"
-        """
         import string
-        # Remove punctuation
         word = word.translate(str.maketrans('', '', string.punctuation))
-        # Lowercase
-        word = word.lower().strip()
-        return word
+        return word.lower().strip()
     
     def find_video(self, word: str) -> Path:
-
         if not word:
             return None
         
-        # Normalize: lowercase + remove punctuation
         key = self.normalize_word(word)
-        
-        if not key:  # Empty after normalization
+        if not key:
             return None
         
-        # Strategy 1: Exact match
-        if key in self.video_cache:
-            video_path = self.video_cache[key]
-            # Verify file still exists
-            if video_path.exists():
-                return video_path
-            else:
-                print(f"      ⚠️ Video file missing: {video_path}")
-                return None
+        # Exact match
+        if key in self.video_cache and self.video_cache[key].exists():
+            return self.video_cache[key]
         
-        # Strategy 2: Windows reserved names (con → con_)
+        # Reserved names (con -> con_)
         if key in self.RESERVED_NAMES:
-            key_reserved = key + '_'
-            if key_reserved in self.video_cache:
-                video_path = self.video_cache[key_reserved]
-                if video_path.exists():
-                    return video_path
+            key_r = key + '_'
+            if key_r in self.video_cache and self.video_cache[key_r].exists():
+                return self.video_cache[key_r]
         
-        # Strategy 3: Underscore format
-        key_underscore = key.replace(' ', '_')
-        if key_underscore in self.video_cache:
-            video_path = self.video_cache[key_underscore]
-            if video_path.exists():
-                return video_path
+        # Underscore format
+        key_u = key.replace(' ', '_')
+        if key_u in self.video_cache and self.video_cache[key_u].exists():
+            return self.video_cache[key_u]
         
-        # Strategy 4: Remove tone marks
-        key_no_tone = self.normalize_for_pronunciation(key)
-        if key_no_tone in self.video_cache:
-            video_path = self.video_cache[key_no_tone]
-            if video_path.exists():
-                return video_path
+        # No tone
+        key_nt = self.normalize_for_pronunciation(key)
+        if key_nt in self.video_cache and self.video_cache[key_nt].exists():
+            return self.video_cache[key_nt]
         
         return None
     
     def get_fingerspell_videos(self, word: str) -> list:
-        """
-        Get list of videos for fingerspelling a word.
-        Returns empty list if cannot fingerspell (missing letter videos).
-        """
         result = []
-        missing_chars = []
-        
         for char in word.lower():
             if char.isalpha():
-                normalized = self.TONE_MAP.get(char, char)
-                video = self.find_video(normalized)
+                norm = self.TONE_MAP.get(char, char)
+                video = self.find_video(norm)
                 if video:
-                    result.append((normalized, video))
+                    result.append((norm, video))
                 else:
-                    missing_chars.append(char)
+                    return []
             elif char.isdigit():
                 video = self.find_video(char)
                 if video:
                     result.append((char, video))
                 else:
-                    missing_chars.append(char)
-            # Skip spaces and special characters
-        
-        # If any character is missing, cannot fingerspell properly
-        if missing_chars:
-            print(f"      Cannot fingerspell '{word}': missing videos for {missing_chars}")
-            return []
-        
+                    return []
         return result
 
 
-# Initialize video mapper
 video_mapper = VideoMapper(VIDEO_DIR)
 
 
-# ============ VIDEO PLAYBACK (THREADED) ============
-# Queue for video playback tasks
-import queue
+# ============ VIDEO PLAYBACK ============
 video_queue = queue.Queue()
 video_thread_running = True
 
 
 def video_playback_worker():
-    """Worker thread that plays videos from queue - doesn't block WebSocket."""
     global video_thread_running, current_state, stop_video
     
     while video_thread_running:
         try:
-            # Wait for video task with timeout (to check running flag)
             task = video_queue.get(timeout=0.5)
             if task is None:
                 continue
@@ -480,12 +380,6 @@ def video_playback_worker():
             current_state = State.PLAYING
             stop_video = False
             
-            print(f"Playing sequence: {words}")
-            
-            played_count = 0
-            skipped_count = 0
-            skipped_words = []
-            
             for word in words:
                 if stop_video:
                     break
@@ -493,36 +387,14 @@ def video_playback_worker():
                 video_path = video_mapper.find_video(word)
                 
                 if video_path:
-                    # Found direct video - play with VIDEO_SPEED
-                    print(f"   ✓ {word} -> {video_path.name}")
                     play_single_video(str(video_path), transcript, speed_multiplier=VIDEO_SPEED)
-                    played_count += 1
                 else:
-                    # Try fingerspelling fallback
                     letters = video_mapper.get_fingerspell_videos(word)
-                    
-                    if letters and len(letters) > 0:
-                        # Can fingerspell - use FINGERSPELL_SPEED
-                        print(f"   🔤 Fingerspelling: {word} ({len(letters)} letters) at {FINGERSPELL_SPEED}x speed")
-                        for letter, letter_video in letters:
+                    if letters:
+                        for letter, lv in letters:
                             if stop_video:
                                 break
-                            # Play with fingerspell speed multiplier
-                            play_single_video(str(letter_video), transcript, speed_multiplier=FINGERSPELL_SPEED)
-                        played_count += 1
-                    else:
-                        # Cannot find video AND cannot fingerspell - SKIP silently
-                        print(f"   ⚠️ SKIP: '{word}' (no video, cannot fingerspell)")
-                        skipped_count += 1
-                        skipped_words.append(word)
-                        continue
-            
-            # Summary (console only, no LCD notification)
-            print(f"   [Summary: {played_count} played, {skipped_count} skipped]")
-            if skipped_words:
-                print(f"   [Skipped words: {', '.join(skipped_words)}]")
-            
-            # NO LCD notification for skipped words - just continue
+                            play_single_video(str(lv), transcript, speed_multiplier=FINGERSPELL_SPEED)
             
             current_state = State.RECORDING
             stop_video = False
@@ -531,57 +403,34 @@ def video_playback_worker():
         except queue.Empty:
             continue
         except Exception as e:
-            print(f"Video worker error: {e}")
+            print(f"Video error: {e}")
 
 
 def play_video_sequence(words: list, transcript: str = ""):
-    """Queue video sequence for playback in background thread."""
     video_queue.put((words, transcript))
 
 
-# Start video worker thread
 video_thread = threading.Thread(target=video_playback_worker, daemon=True)
 video_thread.start()
-print("Video worker thread started")
 
 
 def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0, speed_multiplier: float = 1.0):
-    """
-    Play a single video file on LCD - FULL PLAYBACK with timeout protection.
-    
-    Args:
-        video_path: Path to video file
-        overlay_word: Text to display at bottom
-        max_duration: Absolute max duration to prevent hanging (default 10s)
-        speed_multiplier: Speed multiplier (1.0 = normal, 0.5 = slower, 2.0 = faster)
-    """
     global stop_video
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"   ❌ Cannot open: {video_path}")
         return
-
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
-    # Get video info
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_duration = total_frames / fps if fps > 0 else 0
+    duration = total_frames / fps if fps > 0 else 0
     
-    # Safety check: skip if video is too long or corrupted
-    if video_duration > max_duration or video_duration <= 0:
-        print(f"   ⚠️ SKIP: Video too long ({video_duration:.1f}s) or corrupted")
+    if duration > max_duration or duration <= 0:
         cap.release()
         return
     
-    print(f"   [Video: {total_frames} frames, {fps:.1f}fps, {video_duration:.2f}s, speed={speed_multiplier}x]")
-    
-    # Adjust playback speed with multiplier
     frame_delay = (1.0 / fps if fps > 0 else 0.04) / speed_multiplier
-    
-    frame_count = 0
-    gc_interval = 20
     start_time = time.time()
     
     try:
@@ -590,95 +439,263 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
             if not ret:
                 break
             
-            frame_count += 1
-            
-            # Display every frame
             show_frame(frame, overlay_word)
-            del frame
-
-            # Periodic GC
-            if frame_count % gc_interval == 0:
-                import gc
-                gc.collect()
-
-            # Absolute timeout protection only
-            elapsed = time.time() - start_time
-            if elapsed >= max_duration:
-                print(f"   ⚠️ Timeout reached ({max_duration}s), stopping video")
+            
+            if time.time() - start_time >= max_duration:
                 break
             
             time.sleep(frame_delay)
-        
-        print(f"   [Played: {frame_count}/{total_frames} frames in {time.time() - start_time:.2f}s]")
-            
-    except Exception as e:
-        print(f"   ❌ Video playback error: {e}")
     finally:
         cap.release()
-        import gc
-        gc.collect()
 
 
-# ============ WEBSOCKET CLIENT ============
+# ============ VAD-BASED AUDIO STREAMING ============
+class VADAudioStreamer:
+    """
+    WebRTC VAD-based audio streamer with pre-roll, hangover, and batch sending.
+    Only sends speech segments to reduce bandwidth by 70-90%.
+    """
+    
+    # Max speech segment duration to prevent memory overflow
+    MAX_SPEECH_SECONDS = 8.0
+    
+    def __init__(self):
+        # Initialize VAD (mode 3 = aggressive)
+        if VAD_AVAILABLE:
+            self.vad = webrtcvad.Vad(3)
+        else:
+            self.vad = None
+        
+        # Pre-roll buffer (keep N frames before speech detected)
+        self.preroll_buffer = deque(maxlen=PREROLL_FRAMES)
+        
+        # Current speech segment buffer
+        self.speech_buffer = bytearray()
+        
+        # State
+        self.in_speech = False
+        self.hangover_counter = 0
+        self.speech_frame_count = 0
+        
+        # Batch timing
+        self.last_send_time = time.time()
+        
+        # Adaptive noise floor
+        self.noise_floor = MIN_RMS_THRESHOLD
+        self.noise_samples = deque(maxlen=50)  # ~1 second of samples
+        
+        # Stats
+        self.frames_processed = 0
+        self.frames_sent = 0
+        self.noise_rejected = 0
+    
+    def calculate_rms(self, audio_bytes: bytes) -> float:
+        """Calculate RMS of audio for noise detection."""
+        if len(audio_bytes) < 2:
+            return 0.0
+        n_samples = len(audio_bytes) // 2
+        samples = struct.unpack(f'<{n_samples}h', audio_bytes)
+        return (sum(s*s for s in samples) / n_samples) ** 0.5 if samples else 0
+    
+    def update_noise_floor(self, rms: float, is_speech: bool):
+        """Update adaptive noise floor from silence frames."""
+        if not is_speech and rms > 50 and rms < 2000:
+            self.noise_samples.append(rms)
+            if len(self.noise_samples) >= 10:
+                # Noise floor = 1.5x median of recent silence
+                sorted_samples = sorted(self.noise_samples)
+                median = sorted_samples[len(sorted_samples) // 2]
+                self.noise_floor = max(MIN_RMS_THRESHOLD * 0.5, min(median * 1.5, MIN_RMS_THRESHOLD * 2))
+    
+    def process_frame(self, frame_bytes: bytes) -> bytes:
+        """
+        Process a single 20ms frame through VAD.
+        Returns bytes to send when speech segment completes.
+        """
+        self.frames_processed += 1
+        
+        # Calculate RMS
+        rms = self.calculate_rms(frame_bytes)
+        
+        # Initial VAD check
+        is_speech = False
+        if self.vad:
+            try:
+                is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
+            except:
+                is_speech = rms > self.noise_floor
+        else:
+            is_speech = rms > self.noise_floor
+        
+        # RMS filter - reject obvious noise
+        if rms < self.noise_floor * 0.3 or rms > MAX_RMS_THRESHOLD:
+            self.noise_rejected += 1
+            is_speech = False
+            self.update_noise_floor(rms, False)
+            # Still add to preroll for context
+            if not self.in_speech:
+                self.preroll_buffer.append(frame_bytes)
+            return b''
+        
+        # Update noise floor during silence
+        if not is_speech:
+            self.update_noise_floor(rms, False)
+        
+        if is_speech:
+            if not self.in_speech:
+                # Speech start - include pre-roll
+                self.in_speech = True
+                self.speech_frame_count = 0
+                
+                # Add pre-roll frames
+                for preroll_frame in self.preroll_buffer:
+                    self.speech_buffer.extend(preroll_frame)
+                self.preroll_buffer.clear()
+            
+            # Add current frame
+            self.speech_buffer.extend(frame_bytes)
+            self.speech_frame_count += 1
+            self.hangover_counter = HANGOVER_FRAMES
+            
+            # Check max duration - force flush if too long
+            max_frames = int(self.MAX_SPEECH_SECONDS * 1000 / FRAME_DURATION_MS)
+            if self.speech_frame_count >= max_frames:
+                return self._flush_speech_buffer()
+            
+        else:
+            # Silence/noise
+            if self.in_speech:
+                # In hangover period - keep adding
+                if self.hangover_counter > 0:
+                    self.speech_buffer.extend(frame_bytes)
+                    self.hangover_counter -= 1
+                else:
+                    # Speech ended - flush if long enough
+                    return self._flush_speech_buffer()
+            else:
+                # Add to pre-roll buffer
+                self.preroll_buffer.append(frame_bytes)
+        
+        return b''
+    
+    def _flush_speech_buffer(self) -> bytes:
+        """Flush speech buffer and return data if valid."""
+        self.in_speech = False
+        
+        if self.speech_frame_count >= MIN_SPEECH_FRAMES:
+            result = bytes(self.speech_buffer)
+            self.frames_sent += self.speech_frame_count
+            self.speech_buffer = bytearray()
+            self.speech_frame_count = 0
+            return result
+        
+        self.speech_buffer = bytearray()
+        self.speech_frame_count = 0
+        return b''
+    
+    def should_send_batch(self, is_video_playing: bool = False) -> bool:
+        """Check if it's time to send accumulated data."""
+        send_interval = SEND_INTERVAL_VIDEO if is_video_playing else SEND_INTERVAL_NORMAL
+        return (time.time() - self.last_send_time) >= send_interval
+    
+    def mark_batch_sent(self):
+        """Mark that a batch was sent."""
+        self.last_send_time = time.time()
+    
+    def flush(self) -> bytes:
+        """Flush any remaining speech buffer (called on stop)."""
+        if len(self.speech_buffer) > 0 and self.speech_frame_count >= MIN_SPEECH_FRAMES:
+            result = bytes(self.speech_buffer)
+            self.frames_sent += self.speech_frame_count
+            self.speech_buffer = bytearray()
+            self.speech_frame_count = 0
+            self.in_speech = False
+            return result
+        
+        self.speech_buffer = bytearray()
+        self.speech_frame_count = 0
+        self.in_speech = False
+        return b''
+    
+    def get_stats(self) -> dict:
+        return {
+            'processed': self.frames_processed,
+            'sent': self.frames_sent,
+            'rejected': self.noise_rejected,
+            'noise_floor': f"{self.noise_floor:.0f}",
+            'reduction': f"{100*(1-self.frames_sent/(self.frames_processed or 1)):.1f}%"
+        }
+
+
 async def stream_audio_to_server(ws):
-    """Stream audio chunks to WebSocket server with optional client-side filtering."""
-    global stop_streaming
+    """Stream VAD-filtered audio to WebSocket server."""
+    global stop_streaming, current_state
     
-    print("🎤 Starting audio stream...")
-    if ENABLE_CLIENT_FILTER:
-        print(f"   Client-side filter: RMS >= {CLIENT_MIN_RMS}")
+    streamer = VADAudioStreamer()
+    frame_bytes = FRAME_SIZE * 2  # 16-bit samples
     
-    # Stats for monitoring
-    chunks_sent = 0
-    chunks_filtered = 0
+    print(f"🎤 Starting VAD audio stream (frame={FRAME_DURATION_MS}ms)")
     
-    # Start arecord process with smaller buffer
+    # Start arecord
     process = subprocess.Popen([
         'arecord', '-D', AUDIO_DEVICE,
         '-f', 'S16_LE', '-r', str(SAMPLE_RATE),
         '-c', str(CHANNELS), '-t', 'raw', '-'
-    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=CHUNK_SIZE * 2)
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 4)
+    
+    pending_queue = queue.Queue(maxsize=MAX_PENDING_BATCHES)
     
     try:
         while not stop_streaming:
-            # Read audio chunk
-            audio_data = process.stdout.read(CHUNK_SIZE * 2)  # 16-bit = 2 bytes
-            
-            if not audio_data:
+            # Read one frame
+            frame = process.stdout.read(frame_bytes)
+            if not frame or len(frame) < frame_bytes:
                 break
             
-            # === CLIENT-SIDE FILTERING ===
-            if ENABLE_CLIENT_FILTER:
-                rms = calculate_chunk_rms(audio_data)
-                
-                if rms < CLIENT_MIN_RMS:
-                    # Skip this chunk (silence/noise)
-                    chunks_filtered += 1
-                    del audio_data
-                    await asyncio.sleep(0.005)
-                    continue
+            # Process through VAD - returns speech data when segment completes
+            speech_data = streamer.process_frame(frame)
             
-            # Send to server
-            await ws.send(audio_data)
-            chunks_sent += 1
+            # Check if we have data to send
+            is_video = (current_state == State.PLAYING)
             
-            # Delete audio data immediately after sending to free memory
-            del audio_data
+            if speech_data and len(speech_data) > 0:
+                # Queue for sending (with limit to prevent overflow)
+                if pending_queue.full():
+                    try:
+                        pending_queue.get_nowait()  # Drop oldest
+                    except:
+                        pass
+                pending_queue.put(speech_data)
+                streamer.mark_batch_sent()
             
-            await asyncio.sleep(0.005)  # Minimal delay
+            # Send from queue when interval reached
+            if streamer.should_send_batch(is_video):
+                try:
+                    while not pending_queue.empty():
+                        data = pending_queue.get_nowait()
+                        await ws.send(data)
+                except:
+                    pass
+            
+            await asyncio.sleep(0.001)
+    
     finally:
         process.terminate()
         process.wait()
-        print(f"🎤 Audio stream stopped: {chunks_sent} sent, {chunks_filtered} filtered")
+        
+        # Send flush command
+        try:
+            await ws.send(json.dumps({'type': 'flush'}))
+        except:
+            pass
+        
+        stats = streamer.get_stats()
+        print(f"🎤 Stream ended: {stats}")
 
 
 async def receive_results(ws):
-    """Receive and process results from server."""
+    """Receive results from server."""
     global current_state, stop_streaming
-    
-    # Stats for monitoring
-    results_received = 0
-    filtered_count = 0
     
     try:
         async for message in ws:
@@ -686,92 +703,63 @@ async def receive_results(ws):
             msg_type = data.get('type', '')
             
             if msg_type == 'connected':
-                print(f"Connected: {data.get('message')}")
-                show_message(["Da ket noi!", "", "Dang lang nghe..."], (100, 255, 100))
+                print(f"✅ Connected: {data.get('message', '')}")
+                show_message(["Đã kết nối!", "", "Đang nghe..."], (100, 255, 100))
             
             elif msg_type == 'buffering':
-                progress = data.get('progress', 0)
-                # Only log every 25% to reduce spam
-                if int(progress * 4) != int((progress - 0.25) * 4):
-                    print(f"   Buffering: {progress*100:.0f}%")
+                pass  # Throttled on server, ignore
             
             elif msg_type == 'filtered':
-                # Audio/transcription was filtered (noise/garbage)
-                filtered_count += 1
-                reason = data.get('reason', 'unknown')
-                # Only log occasionally to avoid spam
-                if filtered_count % 10 == 1:
-                    print(f"   🔇 Filtered ({filtered_count}x): {reason}")
+                pass  # Silently ignore filtered
             
             elif msg_type == 'result':
-                results_received += 1
                 transcript = data.get('transcript', '')
-                vsl_text = data.get('vsl_text', '')
                 words = data.get('words', [])
-                confidence = data.get('confidence', 0)
-                
-                print(f"✅ Result #{results_received}:")
-                print(f"   Transcript: {transcript}")
-                print(f"   VSL Text: {vsl_text}")
-                print(f"   Confidence: {confidence:.2f}")
-                
+                print(f"📝 Result: {transcript}")
                 if words:
                     play_video_sequence(words, transcript)
             
             elif msg_type == 'error':
-                print(f"Error: {data.get('error')}")
-                show_message(["Loi!", data.get('error', '')[:20]], (255, 100, 100))
+                print(f"❌ Error: {data.get('error', '')}")
             
             elif msg_type == 'pong':
-                # Heartbeat response, ignore
                 pass
-            
-            # Free message memory after processing
-            del data, message
     
     except Exception as e:
         print(f"Receive error: {e}")
-    finally:
-        print(f"📊 Session stats: {results_received} results, {filtered_count} filtered")
+
+
+async def send_heartbeat(ws):
+    """Periodic heartbeat."""
+    try:
+        while not stop_streaming:
+            await asyncio.sleep(15)
+            if websocket_connected:
+                await ws.send(json.dumps({'type': 'ping'}))
+    except:
+        pass
 
 
 async def websocket_session():
-    """Main WebSocket session with auto-reconnect."""
-    global current_state, stop_streaming, websocket_connected, reconnect_count, is_recording
+    """Main WebSocket session."""
+    global current_state, stop_streaming, websocket_connected, reconnect_count
     
     ws_url = f"{API_URL}{WS_ENDPOINT}"
-    print(f"🔌 Connecting to: {ws_url}")
+    print(f"🔌 Connecting: {ws_url}")
     
     try:
-        async with websockets.connect(
-            ws_url,
-            ping_interval=30,   # Send ping every 30s
-            ping_timeout=60,    # Wait 60s for pong (allow long video playback)
-            close_timeout=10
-        ) as ws:
+        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=60) as ws:
             websocket_connected = True
             current_state = State.RECORDING
-            reconnect_count = 0  # Reset on successful connection
+            reconnect_count = 0
             
-            # Show recording status on LCD
-            show_message([
-                "🔴 ĐANG GHI ÂM",
-                "",
-                "Nói vào micro...",
-                "Nhấn nút để dừng"
-            ], (255, 100, 100), (50, 0, 0))
+            show_message(["🔴 GHI ÂM", "", "Nói vào micro...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
             
-            # Run sender and receiver concurrently
-            sender = asyncio.create_task(stream_audio_to_server(ws))
-            receiver = asyncio.create_task(receive_results(ws))
-            heartbeat = asyncio.create_task(send_heartbeat(ws))
-            
-            # Wait until stop_streaming is set or connection closes
-            # Use ALL_COMPLETED so session stays alive while any task runs
-            try:
-                await asyncio.gather(sender, receiver, heartbeat)
-            except Exception as e:
-                print(f"Task error: {e}")
+            await asyncio.gather(
+                stream_audio_to_server(ws),
+                receive_results(ws),
+                send_heartbeat(ws)
+            )
     
     except websockets.exceptions.ConnectionClosed:
         print("🔌 Connection closed")
@@ -783,19 +771,7 @@ async def websocket_session():
         current_state = State.IDLE
 
 
-async def send_heartbeat(ws):
-    """Send periodic heartbeat to keep connection alive."""
-    try:
-        while not stop_streaming:
-            await asyncio.sleep(15)
-            if websocket_connected:
-                await ws.send(json.dumps({'type': 'ping'}))
-    except:
-        pass
-
-
 async def websocket_session_with_reconnect():
-    """Wrapper with auto-reconnect logic."""
     global reconnect_count, stop_streaming
     
     while not stop_streaming and reconnect_count < MAX_RECONNECT_ATTEMPTS:
@@ -806,16 +782,11 @@ async def websocket_session_with_reconnect():
         
         reconnect_count += 1
         if reconnect_count < MAX_RECONNECT_ATTEMPTS:
-            print(f"🔄 Reconnecting in {RECONNECT_DELAY}s... (attempt {reconnect_count}/{MAX_RECONNECT_ATTEMPTS})")
-            show_message(["Mất kết nối", f"Thử lại {reconnect_count}/{MAX_RECONNECT_ATTEMPTS}"], (255, 200, 100))
+            print(f"🔄 Reconnecting ({reconnect_count}/{MAX_RECONNECT_ATTEMPTS})...")
             await asyncio.sleep(RECONNECT_DELAY)
-        else:
-            print("❌ Max reconnect attempts reached")
-            show_message(["Không thể kết nối", "Nhấn nút để thử lại"], (255, 100, 100))
 
 
 def start_websocket_thread():
-    """Start WebSocket session in a separate thread."""
     global stop_streaming, reconnect_count
     stop_streaming = False
     reconnect_count = 0
@@ -831,52 +802,31 @@ def start_websocket_thread():
 
 # ============ BUTTON HANDLER ============
 def handle_button():
-    """Handle button press - Toggle recording on/off."""
     global current_state, is_recording, stop_streaming, stop_video, ws_thread
     
-    print(f"🔘 Button pressed! State: {current_state}, Recording: {is_recording}")
+    print(f"🔘 Button! State: {current_state}")
     
     if current_state == State.PLAYING:
-        # Stop video playback first
-        print("⏹ Stopping video...")
         stop_video = True
         return
     
     if not is_recording:
-        # ===== START RECORDING =====
-        print("🔴 Starting recording...")
+        # Start recording
         is_recording = True
         stop_streaming = False
         current_state = State.CONNECTING
         
-        show_message([
-            "🔴 GHI ÂM",
-            "",
-            "Đang kết nối...",
-            "Nhấn nút để dừng"
-        ], (255, 100, 100), (50, 0, 0))
+        show_message(["🔴 GHI ÂM", "", "Đang kết nối...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
         
-        # Start WebSocket in background thread
-        ws_thread = threading.Thread(target=start_websocket_thread)
-        ws_thread.daemon = True
+        ws_thread = threading.Thread(target=start_websocket_thread, daemon=True)
         ws_thread.start()
     
     else:
-        # ===== STOP RECORDING =====
-        print("⏹ Stopping recording...")
+        # Stop recording
         is_recording = False
         stop_streaming = True
-        
-        # Send flush command to process remaining audio
-        # (handled in websocket session)
-        
         current_state = State.IDLE
-        show_message([
-            "Đã dừng ghi âm",
-            "",
-            "Nhấn nút để",
-            "ghi lại"
-        ], (100, 255, 100))
+        show_message(["Đã dừng", "", "Nhấn nút để", "ghi lại"], (100, 255, 100))
 
 
 # ============ MAIN ============
@@ -884,28 +834,22 @@ def main():
     global current_state
     
     print("=" * 50)
-    print("🎤 REAL-TIME VSL - Raspberry Pi")
+    print("🎤 REAL-TIME VSL - Raspberry Pi (OPTIMIZED)")
     print("=" * 50)
     print(f"📡 Server: {API_URL}")
     print(f"📹 Videos: {len(video_mapper.video_cache)}")
-    print(f"🔘 Button: GPIO {BUTTON_PIN}")
+    print(f"🎙️ VAD: {'ENABLED' if VAD_AVAILABLE else 'DISABLED (RMS only)'}")
+    print(f"🔧 Frame: {FRAME_DURATION_MS}ms, Pre-roll: {PREROLL_FRAMES*FRAME_DURATION_MS}ms, Hangover: {HANGOVER_FRAMES*FRAME_DURATION_MS}ms")
     print("=" * 50)
     
-    print("Initializing LCD...")
     init_lcd()
     print("✅ LCD OK!")
     
-    show_message([
-        "Real-Time VSL",
-        "",
-        "Nhấn nút để",
-        "bắt đầu"
-    ], (100, 255, 100))
+    show_message(["Real-Time VSL", "(Optimized)", "", "Nhấn nút để", "bắt đầu"], (100, 255, 100))
     
     last_state = GPIO.HIGH
     
     print("\n✅ Ready! Press button to start...")
-    print("   Press Ctrl+C to exit\n")
     
     try:
         while True:
@@ -913,7 +857,7 @@ def main():
             
             if last_state == GPIO.HIGH and current_btn == GPIO.LOW:
                 handle_button()
-                time.sleep(0.3)  # Debounce
+                time.sleep(0.3)
             
             last_state = current_btn
             time.sleep(0.01)
