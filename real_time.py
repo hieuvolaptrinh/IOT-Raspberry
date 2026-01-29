@@ -489,12 +489,18 @@ def play_video_sequence(words: list, transcript: str = ""):
 video_thread = threading.Thread(target=video_playback_worker, daemon=True)
 video_thread.start()
 
-# ============ VAD-BASED AUDIO STREAMING ============
+# ============ VAD-BASED AUDIO STREAMING (SIMPLIFIED) ============
 class VADAudioStreamer:
-    MAX_SPEECH_SECONDS = 10.0  # nới hơn chút để ít flush giữa câu
+    """
+    Simplified VAD Streamer cho Raspberry Pi Zero 2.
+    - Chỉ dùng webrtcvad để detect speech
+    - RMS sanity check cơ bản (loại im lặng hoàn toàn và clipping)
+    - Silero VAD ở backend sẽ filter lần cuối
+    """
+    MAX_SPEECH_SECONDS = 10.0
 
     def __init__(self):
-        # 0..3, 1 = less aggressive
+        # webrtcvad mode 1 = ít aggressive, nhạy hơn
         self.vad = webrtcvad.Vad(1) if VAD_AVAILABLE else None
 
         self.preroll_buffer = deque(maxlen=PREROLL_FRAMES)
@@ -506,12 +512,9 @@ class VADAudioStreamer:
 
         self.last_send_time = time.time()
 
-        self.noise_floor = float(MIN_RMS_THRESHOLD)
-        self.noise_samples = deque(maxlen=50)
-
+        # Stats
         self.frames_processed = 0
         self.frames_sent = 0
-        self.noise_rejected = 0
 
     def calculate_rms(self, audio_bytes: bytes) -> float:
         if len(audio_bytes) < 2:
@@ -522,66 +525,31 @@ class VADAudioStreamer:
             return 0.0
         return (sum(s * s for s in samples) / n_samples) ** 0.5
 
-    def update_noise_floor(self, rms: float, is_speech: bool):
-        """
-        Giữ noise_floor thấp và ổn định để không "ăn" mất giọng nhỏ.
-        """
-        if is_speech:
-            return
-
-        if 10 < rms < 1200:
-            self.noise_samples.append(rms)
-            if len(self.noise_samples) >= 12:
-                sorted_samples = sorted(self.noise_samples)
-                median = sorted_samples[len(sorted_samples) // 2]
-                nf = median * 1.10
-                nf = max(20.0, min(nf, 180.0))
-                self.noise_floor = nf
-
     def process_frame(self, frame_bytes: bytes) -> bytes:
         self.frames_processed += 1
-
         rms = self.calculate_rms(frame_bytes)
 
-        # VAD decision
+        # Sanity check: loại im lặng hoàn toàn và clipping
+        if rms < 10 or rms > MAX_RMS_THRESHOLD:
+            if not self.in_speech:
+                self.preroll_buffer.append(frame_bytes)
+            return b''
+
+        # VAD decision (tin tưởng webrtcvad)
         is_speech = False
         if self.vad:
             try:
                 is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
             except:
-                is_speech = rms > self.noise_floor
+                is_speech = rms > MIN_RMS_THRESHOLD
         else:
-            is_speech = rms > self.noise_floor
-
-        # FAIL-OPEN sanity check
-        if rms < 8:
-            self.noise_rejected += 1
-            self.update_noise_floor(rms, False)
-            if not self.in_speech:
-                self.preroll_buffer.append(frame_bytes)
-            return b''
-
-        if rms > MAX_RMS_THRESHOLD:
-            self.noise_rejected += 1
-            if not self.in_speech:
-                self.preroll_buffer.append(frame_bytes)
-            return b''
-
-        # Backup: VAD false nhưng RMS vượt noise_floor rõ -> coi như speech
-        if not is_speech and rms > (self.noise_floor * 1.25):
-            is_speech = True
-
-        if is_speech and not self.in_speech:
-            print(f"🎤 Speech START (RMS: {rms:.0f}, noise_floor: {self.noise_floor:.0f})")
-
-        if not is_speech:
-            self.update_noise_floor(rms, False)
+            is_speech = rms > MIN_RMS_THRESHOLD
 
         if is_speech:
             if not self.in_speech:
                 self.in_speech = True
                 self.speech_frame_count = 0
-
+                # Thêm preroll buffer
                 for preroll_frame in self.preroll_buffer:
                     self.speech_buffer.extend(preroll_frame)
                 self.preroll_buffer.clear()
@@ -590,10 +558,10 @@ class VADAudioStreamer:
             self.speech_frame_count += 1
             self.hangover_counter = HANGOVER_FRAMES
 
+            # Max duration check
             max_frames = int(self.MAX_SPEECH_SECONDS * 1000 / FRAME_DURATION_MS)
             if self.speech_frame_count >= max_frames:
                 return self._flush_speech_buffer()
-
         else:
             if self.in_speech:
                 if self.hangover_counter > 0:
@@ -608,14 +576,12 @@ class VADAudioStreamer:
 
     def _flush_speech_buffer(self) -> bytes:
         self.in_speech = False
-
         if self.speech_frame_count >= MIN_SPEECH_FRAMES:
             result = bytes(self.speech_buffer)
             self.frames_sent += self.speech_frame_count
             self.speech_buffer = bytearray()
             self.speech_frame_count = 0
             return result
-
         self.speech_buffer = bytearray()
         self.speech_frame_count = 0
         return b''
@@ -635,7 +601,6 @@ class VADAudioStreamer:
             self.speech_frame_count = 0
             self.in_speech = False
             return result
-
         self.speech_buffer = bytearray()
         self.speech_frame_count = 0
         self.in_speech = False
@@ -645,8 +610,6 @@ class VADAudioStreamer:
         return {
             'processed': self.frames_processed,
             'sent': self.frames_sent,
-            'rejected': self.noise_rejected,
-            'noise_floor': f"{self.noise_floor:.0f}",
             'reduction': f"{100 * (1 - self.frames_sent / (self.frames_processed or 1)):.1f}%"
         }
 
