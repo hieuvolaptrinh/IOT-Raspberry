@@ -49,22 +49,25 @@ FINGERSPELL_SPEED = 2.5
 RECONNECT_DELAY = 3
 MAX_RECONNECT_ATTEMPTS = 5
 
-# ============ VAD SETTINGS (SENSITIVE, FAIL-OPEN) ============
+# ============ VAD SETTINGS (BALANCED) ============
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-FRAME_DURATION_MS = 30                 # 10/20/30ms (30ms ổn định hơn)
-FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 480 samples @16kHz
+FRAME_DURATION_MS = 30
+FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 480 samples
 
-PREROLL_FRAMES = 20                    # 600ms
-HANGOVER_FRAMES = 30                   # 900ms
-MIN_SPEECH_FRAMES = 2                  # 60ms
+PREROLL_FRAMES = 10                    # 300ms - đủ để không cắt đầu
+HANGOVER_FRAMES = 15                   # 450ms - giảm gộp noise
+MIN_SPEECH_FRAMES = 7                  # 210ms - tránh segment quá ngắn
 
-SEND_INTERVAL_NORMAL = 0.06
-SEND_INTERVAL_VIDEO = 0.12
+SEND_INTERVAL_NORMAL = 0.05
+SEND_INTERVAL_VIDEO = 0.1
 
-MIN_RMS_THRESHOLD = 100                # nhạy hơn
+MIN_RMS_THRESHOLD = 120                # cân bằng
 MAX_RMS_THRESHOLD = 32000
+
+PLAYBACK_COOLDOWN_MS = 500             # cooldown sau video
+NOISE_CALIBRATION_FRAMES = 50          # ~1.5s calibration
 
 MAX_PENDING_BATCHES = 5
 
@@ -473,7 +476,8 @@ def video_playback_worker():
                                 break
                             play_single_video(str(lv), transcript, speed_multiplier=FINGERSPELL_SPEED)
 
-            # 🎤 Chuyển về RECORDING sau khi phát xong
+            # 🎤 Trigger cooldown + chuyển về RECORDING
+            signal_playback_ended()
             current_state = State.RECORDING
             stop_video = False
             video_queue.task_done()
@@ -489,19 +493,27 @@ def play_video_sequence(words: list, transcript: str = ""):
 video_thread = threading.Thread(target=video_playback_worker, daemon=True)
 video_thread.start()
 
-# ============ VAD-BASED AUDIO STREAMING (SIMPLIFIED) ============
+# ============ COOLDOWN SIGNAL (global) ============
+_playback_end_time = 0.0
+
+def signal_playback_ended():
+    """Gọi khi video playback kết thúc để trigger cooldown."""
+    global _playback_end_time
+    _playback_end_time = time.time()
+
+# ============ VAD-BASED AUDIO STREAMING (OPTIMIZED) ============
 class VADAudioStreamer:
     """
-    Simplified VAD Streamer cho Raspberry Pi Zero 2.
-    - Chỉ dùng webrtcvad để detect speech
-    - RMS sanity check cơ bản (loại im lặng hoàn toàn và clipping)
-    - Silero VAD ở backend sẽ filter lần cuối
+    Optimized VAD Streamer cho Raspberry Pi Zero 2.
+    - webrtcvad mode 2 (balanced)
+    - Adaptive noise floor calibration
+    - Cooldown sau video playback
     """
-    MAX_SPEECH_SECONDS = 10.0
+    MAX_SPEECH_SECONDS = 8.0  # Giảm để tránh Whisper hallucinate
 
     def __init__(self):
-        # webrtcvad mode 1 = ít aggressive, nhạy hơn
-        self.vad = webrtcvad.Vad(1) if VAD_AVAILABLE else None
+        # Mode 2 = balanced (giảm false positive, vẫn nhạy)
+        self.vad = webrtcvad.Vad(2) if VAD_AVAILABLE else None
 
         self.preroll_buffer = deque(maxlen=PREROLL_FRAMES)
         self.speech_buffer = bytearray()
@@ -509,108 +521,137 @@ class VADAudioStreamer:
         self.in_speech = False
         self.hangover_counter = 0
         self.speech_frame_count = 0
-
         self.last_send_time = time.time()
+
+        # Adaptive noise floor
+        self._noise_samples = []
+        self._noise_floor = MIN_RMS_THRESHOLD
+        self._calibrated = False
 
         # Stats
         self.frames_processed = 0
         self.frames_sent = 0
 
-    def calculate_rms(self, audio_bytes: bytes) -> float:
+    def _calculate_rms(self, audio_bytes: bytes) -> float:
+        """RMS calculation using numpy for speed."""
         if len(audio_bytes) < 2:
             return 0.0
-        n_samples = len(audio_bytes) // 2
-        samples = struct.unpack(f'<{n_samples}h', audio_bytes)
-        if not samples:
-            return 0.0
-        return (sum(s * s for s in samples) / n_samples) ** 0.5
+        samples = np.frombuffer(audio_bytes, dtype=np.int16)
+        return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+
+    def _is_in_cooldown(self) -> bool:
+        """Check if in cooldown period after video playback."""
+        return (time.time() - _playback_end_time) * 1000 < PLAYBACK_COOLDOWN_MS
+
+    def _calibrate_noise(self, rms: float):
+        """Calibrate noise floor from initial frames."""
+        if self._calibrated or self.in_speech:
+            return
+        self._noise_samples.append(rms)
+        if len(self._noise_samples) >= NOISE_CALIBRATION_FRAMES:
+            # Median for robustness
+            sorted_samples = sorted(self._noise_samples)
+            median = sorted_samples[len(sorted_samples) // 2]
+            self._noise_floor = max(80.0, min(median * 1.5, 400.0))
+            self._calibrated = True
+            print(f"🎚️ Noise floor: {self._noise_floor:.0f}")
 
     def process_frame(self, frame_bytes: bytes) -> bytes:
         self.frames_processed += 1
-        rms = self.calculate_rms(frame_bytes)
 
-        # Sanity check: loại im lặng hoàn toàn và clipping
+        # Skip during cooldown (echo prevention)
+        if self._is_in_cooldown():
+            self.preroll_buffer.append(frame_bytes)
+            return b''
+
+        rms = self._calculate_rms(frame_bytes)
+
+        # Calibrate noise floor
+        self._calibrate_noise(rms)
+
+        # Skip silence/clipping
         if rms < 10 or rms > MAX_RMS_THRESHOLD:
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
             return b''
 
-        # VAD decision (tin tưởng webrtcvad)
+        # Dynamic threshold
+        threshold = self._noise_floor if self._calibrated else MIN_RMS_THRESHOLD
+
+        # VAD decision
         is_speech = False
         if self.vad:
             try:
                 is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
+                # Double-check với RMS để giảm false positive
+                if is_speech and rms < threshold * 0.8:
+                    is_speech = False
             except:
-                is_speech = rms > MIN_RMS_THRESHOLD
+                is_speech = rms > threshold
         else:
-            is_speech = rms > MIN_RMS_THRESHOLD
+            is_speech = rms > threshold
 
         if is_speech:
             if not self.in_speech:
                 self.in_speech = True
                 self.speech_frame_count = 0
-                # Thêm preroll buffer
-                for preroll_frame in self.preroll_buffer:
-                    self.speech_buffer.extend(preroll_frame)
+                # Add preroll
+                for pf in self.preroll_buffer:
+                    self.speech_buffer.extend(pf)
                 self.preroll_buffer.clear()
 
             self.speech_buffer.extend(frame_bytes)
             self.speech_frame_count += 1
             self.hangover_counter = HANGOVER_FRAMES
 
-            # Max duration check
-            max_frames = int(self.MAX_SPEECH_SECONDS * 1000 / FRAME_DURATION_MS)
-            if self.speech_frame_count >= max_frames:
-                return self._flush_speech_buffer()
+            # Max duration
+            if self.speech_frame_count >= int(self.MAX_SPEECH_SECONDS * 1000 / FRAME_DURATION_MS):
+                return self._flush()
         else:
             if self.in_speech:
                 if self.hangover_counter > 0:
                     self.speech_buffer.extend(frame_bytes)
                     self.hangover_counter -= 1
                 else:
-                    return self._flush_speech_buffer()
+                    return self._flush()
             else:
                 self.preroll_buffer.append(frame_bytes)
 
         return b''
 
-    def _flush_speech_buffer(self) -> bytes:
+    def _flush(self) -> bytes:
+        """Flush speech buffer if meets minimum length."""
         self.in_speech = False
+        self.hangover_counter = 0
+        
         if self.speech_frame_count >= MIN_SPEECH_FRAMES:
             result = bytes(self.speech_buffer)
             self.frames_sent += self.speech_frame_count
-            self.speech_buffer = bytearray()
-            self.speech_frame_count = 0
-            return result
+        else:
+            result = b''
+        
         self.speech_buffer = bytearray()
         self.speech_frame_count = 0
-        return b''
+        return result
 
     def should_send_batch(self, is_video_playing: bool = False) -> bool:
-        send_interval = SEND_INTERVAL_VIDEO if is_video_playing else SEND_INTERVAL_NORMAL
-        return (time.time() - self.last_send_time) >= send_interval
+        interval = SEND_INTERVAL_VIDEO if is_video_playing else SEND_INTERVAL_NORMAL
+        return (time.time() - self.last_send_time) >= interval
 
     def mark_batch_sent(self):
         self.last_send_time = time.time()
 
     def flush(self) -> bytes:
-        if len(self.speech_buffer) > 0 and self.speech_frame_count >= MIN_SPEECH_FRAMES:
-            result = bytes(self.speech_buffer)
-            self.frames_sent += self.speech_frame_count
-            self.speech_buffer = bytearray()
-            self.speech_frame_count = 0
-            self.in_speech = False
-            return result
-        self.speech_buffer = bytearray()
-        self.speech_frame_count = 0
-        self.in_speech = False
-        return b''
+        """Force flush remaining buffer."""
+        return self._flush()
 
     def get_stats(self) -> dict:
+        total = self.frames_processed or 1
         return {
             'processed': self.frames_processed,
             'sent': self.frames_sent,
-            'reduction': f"{100 * (1 - self.frames_sent / (self.frames_processed or 1)):.1f}%"
+            'noise_floor': self._noise_floor,
+            'reduction': f"{100 * (1 - self.frames_sent / total):.1f}%"
         }
 
 async def stream_audio_to_server(ws):
