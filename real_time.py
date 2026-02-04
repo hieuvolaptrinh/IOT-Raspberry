@@ -212,10 +212,6 @@ def init_lcd():
 _display_buffer = np.empty((240, 240, 2), dtype=np.uint8)
 _rgb565_buffer = np.empty((240, 240), dtype=np.uint16)
 
-# ============ OVERLAY CACHE ============
-_overlay_cache = {}  # {text: bgr_overlay_array}
-_overlay_cache_max = 50
-
 def _create_text_overlay(text: str) -> np.ndarray:
     """Tạo overlay text dưới dạng BGR numpy array (240x40)."""
     pil_img = Image.new('RGB', (240, 40), (0, 0, 0))
@@ -234,27 +230,14 @@ def _create_text_overlay(text: str) -> np.ndarray:
     # Convert to BGR numpy array
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-def _get_cached_overlay(text: str) -> np.ndarray:
-    """Lấy hoặc tạo cached overlay."""
-    global _overlay_cache
-    
-    if text not in _overlay_cache:
-        # Clear cache nếu quá lớn
-        if len(_overlay_cache) >= _overlay_cache_max:
-            _overlay_cache.clear()
-        
-        _overlay_cache[text] = _create_text_overlay(text)
-    
-    return _overlay_cache[text]
-
 def show_frame(frame, overlay_text=None):
     global _display_buffer, _rgb565_buffer
 
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
 
-    # Composite overlay bằng numpy (nhanh hơn PIL)
+    # Composite overlay
     if overlay_text:
-        overlay = _get_cached_overlay(overlay_text)
+        overlay = _create_text_overlay(overlay_text)
         frame[200:240, :] = overlay  # Dán overlay vào bottom 40px
 
     if MIRROR_MODE:
@@ -383,7 +366,7 @@ class VideoMapper:
 video_mapper = VideoMapper(VIDEO_DIR)
 
 # ============ VIDEO PLAYBACK ============
-video_queue = queue.Queue()
+video_queue = queue.Queue(maxsize=3)  # Chỉ giữ 3 response mới nhất
 video_thread_running = True
 
 def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0, speed_multiplier: float = 1.0):
@@ -476,11 +459,14 @@ def video_playback_worker():
                                 break
                             play_single_video(str(lv), transcript, speed_multiplier=FINGERSPELL_SPEED)
 
-            # 🎤 Trigger cooldown + chuyển về RECORDING
+            # 🎤 Trigger cooldown + TỰ ĐỘNG tiếp tục ghi âm
             signal_playback_ended()
             current_state = State.RECORDING
             stop_video = False
             video_queue.task_done()
+            
+            # Hiển thị sẵn sàng nghe tiếp
+            show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
 
         except queue.Empty:
             continue
@@ -488,6 +474,14 @@ def video_playback_worker():
             print(f"Video error: {e}")
 
 def play_video_sequence(words: list, transcript: str = ""):
+    """Add video sequence to queue. Drop oldest if full (max 3)."""
+    if video_queue.full():
+        try:
+            old = video_queue.get_nowait()
+            video_queue.task_done()
+            print(f"⚠️ Queue full, dropped: {old[0][:2]}...")
+        except:
+            pass
     video_queue.put((words, transcript))
 
 video_thread = threading.Thread(target=video_playback_worker, daemon=True)
