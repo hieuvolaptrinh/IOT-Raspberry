@@ -523,11 +523,6 @@ class VADAudioStreamer:
         self.speech_frame_count = 0
         self.last_send_time = time.time()
 
-        # Adaptive noise floor
-        self._noise_samples = []
-        self._noise_floor = MIN_RMS_THRESHOLD
-        self._calibrated = False
-
         # Stats
         self.frames_processed = 0
         self.frames_sent = 0
@@ -554,22 +549,11 @@ class VADAudioStreamer:
 
         rms = self._calculate_rms(frame_bytes)
 
-        # Debug log mỗi 200 frames (~6s) - giảm spam
+        # Debug log mỗi 200 frames (~6s)
         if self.frames_processed % 200 == 0:
-            print(f"🎤 RMS={rms:.0f} | floor={self._noise_floor:.0f} | calibrated={self._calibrated}")
+            print(f"🎤 RMS={rms:.0f} | in_speech={self.in_speech}")
 
-        # Calibrate noise floor - dùng 25th percentile (robust hơn median khi có speech)
-        if not self._calibrated and not self.in_speech:
-            self._noise_samples.append(rms)
-            if len(self._noise_samples) >= NOISE_CALIBRATION_FRAMES:
-                sorted_samples = sorted(self._noise_samples)
-                # 25th percentile thay vì median - tránh bị nhiễu bởi speech
-                p25 = sorted_samples[len(sorted_samples) // 4]
-                self._noise_floor = max(50.0, min(p25 * 1.2, 180.0))
-                self._calibrated = True
-                print(f"🎚️ Noise floor: {self._noise_floor:.0f} (p25={p25:.0f})")
-
-        # Skip silence hoàn toàn (threshold thấp hơn: 5 thay vì 10)
+        # Skip silence hoàn toàn (RMS < 5 = hoàn toàn im lặng)
         if rms < 5:
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
@@ -579,24 +563,21 @@ class VADAudioStreamer:
         if rms > MAX_RMS_THRESHOLD:
             return b''
 
-        # Dynamic threshold - nhạy hơn khi không có VAD
-        if self._calibrated:
-            threshold = self._noise_floor
-        else:
-            # Chưa calibrate: dùng threshold thấp hơn khi không có VAD
-            threshold = MIN_RMS_THRESHOLD * 0.7 if not self.vad else MIN_RMS_THRESHOLD
+        # Fixed threshold thấp - để Silero VAD backend lọc
+        threshold = 80  # Threshold cố định thấp
 
         # VAD decision
         is_speech = False
         if self.vad:
             try:
                 is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
-                if is_speech and rms < threshold * 0.7:
+                # Chỉ reject nếu RMS quá thấp (< 50)
+                if is_speech and rms < 50:
                     is_speech = False
             except:
                 is_speech = rms > threshold
         else:
-            # Không có VAD: chỉ dựa vào RMS
+            # Không có VAD: dựa vào RMS
             is_speech = rms > threshold
 
         if is_speech:
@@ -657,7 +638,6 @@ class VADAudioStreamer:
         return {
             'processed': self.frames_processed,
             'sent': self.frames_sent,
-            'noise_floor': self._noise_floor,
             'reduction': f"{100 * (1 - self.frames_sent / total):.1f}%"
         }
 
