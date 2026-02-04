@@ -89,14 +89,14 @@ FONT_PATH = os.path.join(SCRIPT_DIR, "SVN-Arial Regular.ttf")
 
 # ============ STATE ============
 class State:
-    IDLE = 0
-    CONNECTING = 1
-    RECORDING = 2
-    PROCESSING = 3
-    PLAYING = 4
+    IDLE = 0        # Chưa kết nối
+    CONNECTING = 1  # Đang kết nối WebSocket
+    CONNECTED = 2   # Đã kết nối, chờ ghi âm
+    RECORDING = 3   # Đang ghi âm
+    PLAYING = 4     # Đang phát video
 
 current_state = State.IDLE
-is_recording = False
+ws_connection_ready = False
 stop_streaming = False
 stop_video = False
 websocket_connected = False
@@ -681,13 +681,14 @@ async def stream_audio_to_server(ws):
             if not frame or len(frame) < frame_bytes:
                 break
 
-            # Block audio khi đang phát video
-            if current_state == State.PLAYING:
+            # Chỉ ghi âm khi đang ở state RECORDING
+            if current_state != State.RECORDING:
+                # Vẫn đọc frame để không block pipe, nhưng không xử lý
                 continue
 
             speech_data = streamer.process_frame(frame)
 
-            # Gửi ngay khi có speech data (không cần queue)
+            # Gửi ngay khi có speech data
             if speech_data:
                 try:
                     await ws.send(speech_data)
@@ -752,10 +753,10 @@ async def websocket_session():
     try:
         async with websockets.connect(ws_url, ping_interval=30, ping_timeout=60) as ws:
             websocket_connected = True
-            current_state = State.RECORDING
+            current_state = State.CONNECTED  # Chờ user nhấn nút để ghi âm
             reconnect_count = 0
 
-            show_message(["🔴 GHI ÂM", "", "Nói vào micro...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+            show_message(["✅ Đã kết nối!", "", "Nhấn nút để", "bắt đầu ghi"], (100, 255, 100))
 
             await asyncio.gather(
                 stream_audio_to_server(ws),
@@ -799,20 +800,23 @@ def start_websocket_thread():
     finally:
         loop.close()
 
-# ============ BUTTON HANDLER ============
+# ============ BUTTON HANDLER (3-STATE FLOW) ============
 def handle_button():
-    global current_state, is_recording, stop_streaming, stop_video, ws_thread
+    """
+    3-state button flow:
+    1. IDLE → CONNECTING → CONNECTED: Nhấn lần 1 để kết nối
+    2. CONNECTED → RECORDING: Nhấn lần 2 để ghi âm
+    3. RECORDING → IDLE: Nhấn lần 3 để dừng
+    """
+    global current_state, ws_connection_ready, stop_streaming, stop_video, ws_thread
 
-    print(f"🔘 Button! State: {current_state}")
+    state_names = {0: 'IDLE', 1: 'CONNECTING', 2: 'CONNECTED', 3: 'RECORDING', 4: 'PLAYING'}
+    print(f"🔘 Button! State: {state_names.get(current_state, current_state)}")
 
-    # Nếu đang phát video -> dừng cả ghi âm và phát video
+    # === STATE: PLAYING → Dừng video, về CONNECTED ===
     if current_state == State.PLAYING:
-        print("⏹️ Stopping video and recording...")
+        print("⏹️ Stopping video...")
         stop_video = True
-        stop_streaming = True
-        is_recording = False
-        current_state = State.IDLE
-        
         # Clear video queue
         while not video_queue.empty():
             try:
@@ -820,24 +824,39 @@ def handle_button():
                 video_queue.task_done()
             except:
                 break
-        
-        show_message(["Đã dừng", "", "Nhấn nút để", "ghi lại"], (100, 255, 100))
+        current_state = State.CONNECTED
+        show_message(["Đã dừng video", "", "Nhấn nút để", "ghi tiếp"], (100, 255, 100))
         return
 
-    # Nếu chưa ghi âm -> bắt đầu ghi âm
-    if not is_recording:
-        is_recording = True
+    # === STATE: IDLE → CONNECTING ===
+    if current_state == State.IDLE:
+        print("🔌 Connecting WebSocket...")
+        current_state = State.CONNECTING
         stop_streaming = False
         stop_video = False
-        current_state = State.CONNECTING
-
-        show_message(["🔴 GHI ÂM", "", "Đang kết nối...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
-
+        
+        show_message(["Đang kết nối...", "", "Vui lòng chờ"], (255, 255, 100))
+        
         ws_thread = threading.Thread(target=start_websocket_thread, daemon=True)
         ws_thread.start()
-    # Nếu đang ghi âm -> dừng ghi âm
-    else:
-        is_recording = False
+        return
+
+    # === STATE: CONNECTING → Đang chờ, không làm gì ===
+    if current_state == State.CONNECTING:
+        print("⏳ Still connecting, please wait...")
+        show_message(["Đang kết nối...", "", "Vui lòng chờ"], (255, 255, 100))
+        return
+
+    # === STATE: CONNECTED → RECORDING ===
+    if current_state == State.CONNECTED:
+        print("🎤 Start recording...")
+        current_state = State.RECORDING
+        show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+        return
+
+    # === STATE: RECORDING → IDLE (Dừng hoàn toàn) ===
+    if current_state == State.RECORDING:
+        print("⏹️ Stop recording...")
         stop_streaming = True
         stop_video = True
         current_state = State.IDLE
@@ -850,7 +869,8 @@ def handle_button():
             except:
                 break
         
-        show_message(["Đã dừng", "", "Nhấn nút để", "ghi lại"], (100, 255, 100))
+        show_message(["Đã dừng", "", "Nhấn nút để", "kết nối lại"], (100, 255, 100))
+        return
 
 # ============ MAIN ============
 def main():
@@ -868,7 +888,7 @@ def main():
     init_lcd()
     print("✅ LCD OK!")
 
-    show_message(["Real-Time VSL", "(Sensitive)", "", "Nhấn nút để", "bắt đầu"], (100, 255, 100))
+    show_message(["Real-Time VSL", "", "Nhấn 1: Kết nối", "Nhấn 2: Ghi âm", "Nhấn 3: Dừng"], (100, 255, 100))
 
     last_state = GPIO.HIGH
     print("\n✅ Ready! Press button to start...")
