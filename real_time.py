@@ -558,16 +558,16 @@ class VADAudioStreamer:
         if self.frames_processed % 200 == 0:
             print(f"🎤 RMS={rms:.0f} | floor={self._noise_floor:.0f} | calibrated={self._calibrated}")
 
-        # Calibrate noise floor TRƯỚC khi skip (kể cả frames thấp)
+        # Calibrate noise floor - dùng 25th percentile (robust hơn median khi có speech)
         if not self._calibrated and not self.in_speech:
             self._noise_samples.append(rms)
             if len(self._noise_samples) >= NOISE_CALIBRATION_FRAMES:
                 sorted_samples = sorted(self._noise_samples)
-                median = sorted_samples[len(sorted_samples) // 2]
-                # Nhân 1.3 thay vì 1.5 để nhạy hơn
-                self._noise_floor = max(50.0, min(median * 1.3, 300.0))
+                # 25th percentile thay vì median - tránh bị nhiễu bởi speech
+                p25 = sorted_samples[len(sorted_samples) // 4]
+                self._noise_floor = max(50.0, min(p25 * 1.2, 180.0))
                 self._calibrated = True
-                print(f"🎚️ Noise floor calibrated: {self._noise_floor:.0f} (median={median:.0f})")
+                print(f"🎚️ Noise floor: {self._noise_floor:.0f} (p25={p25:.0f})")
 
         # Skip silence hoàn toàn (threshold thấp hơn: 5 thay vì 10)
         if rms < 5:
