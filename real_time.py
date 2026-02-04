@@ -635,13 +635,21 @@ class VADAudioStreamer:
             'reduction': f"{100 * (1 - self.frames_sent / total):.1f}%"
         }
 
-async def stream_audio_to_server(ws):
+async def stream_audio_to_server(ws, connection_ready_event):
     global stop_streaming, current_state
 
+    # Chờ server xác nhận connected trước khi bắt đầu
+    print("⏳ Waiting for server confirmation...")
+    try:
+        await asyncio.wait_for(connection_ready_event.wait(), timeout=10.0)
+    except asyncio.TimeoutError:
+        print("❌ Connection confirmation timeout!")
+        return
+    
     streamer = VADAudioStreamer()
     frame_bytes = FRAME_SIZE * 2  # 16-bit
 
-    print(f"🎤 Starting audio stream (frame={FRAME_DURATION_MS}ms)")
+    print(f"🎤 Audio stream ready (frame={FRAME_DURATION_MS}ms)")
 
     process = subprocess.Popen([
         'arecord', '-D', AUDIO_DEVICE,
@@ -650,7 +658,7 @@ async def stream_audio_to_server(ws):
     ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 2)
 
     try:
-        while not stop_streaming:
+        while not stop_streaming and websocket_connected:
             frame = process.stdout.read(frame_bytes)
             if not frame or len(frame) < frame_bytes:
                 break
@@ -666,26 +674,31 @@ async def stream_audio_to_server(ws):
             if speech_data:
                 try:
                     await ws.send(speech_data)
+                    print(f"📤 Sent {len(speech_data)} bytes")
+                except websockets.exceptions.ConnectionClosed:
+                    print("🔌 Connection closed during send")
+                    break
                 except Exception as e:
                     print(f"❌ Send error: {e}")
                     break
 
     finally:
-        # Flush remaining
-        try:
-            remain = streamer.flush()
-            if remain:
-                await ws.send(remain)
-            await ws.send(json.dumps({'type': 'flush'}))
-        except:
-            pass
+        # Flush remaining (chỉ khi còn kết nối)
+        if websocket_connected:
+            try:
+                remain = streamer.flush()
+                if remain:
+                    await ws.send(remain)
+                await ws.send(json.dumps({'type': 'flush'}))
+            except:
+                pass
 
         process.terminate()
         process.wait()
         print(f"🎤 Stream ended: {streamer.get_stats()}")
 
-async def receive_results(ws):
-    global current_state, stop_streaming
+async def receive_results(ws, connection_ready_event):
+    global current_state, stop_streaming, websocket_connected
 
     try:
         async for message in ws:
@@ -693,8 +706,14 @@ async def receive_results(ws):
             msg_type = data.get('type', '')
 
             if msg_type == 'connected':
-                print(f"✅ Connected: {data.get('message', '')}")
-                show_message(["Đã kết nối!", "", "Đang nghe..."], (100, 255, 100))
+                print(f"✅ Server confirmed: {data.get('message', '')}")
+                current_state = State.CONNECTED  # Chuyển sang CONNECTED khi server xác nhận
+                connection_ready_event.set()  # Signal that connection is ready
+                show_message(["✅ Đã kết nối!", "", "Nhấn nút để", "bắt đầu ghi"], (100, 255, 100))
+
+            elif msg_type == 'buffering':
+                # Server đang buffer, ignore
+                pass
 
             elif msg_type == 'result':
                 transcript = data.get('transcript', '')
@@ -703,18 +722,31 @@ async def receive_results(ws):
                 if words:
                     play_video_sequence(words, transcript)
 
-            elif msg_type == 'error':
-                print(f"❌ Error: {data.get('error', '')}")
+            elif msg_type == 'filtered':
+                print(f"🔇 Filtered: {data.get('reason', '')}")
 
+            elif msg_type == 'error':
+                print(f"❌ Server error: {data.get('error', '')}")
+
+            elif msg_type == 'pong':
+                pass  # Heartbeat response
+
+    except websockets.exceptions.ConnectionClosed as e:
+        print(f"🔌 Connection closed: {e.code} {e.reason}")
     except Exception as e:
         print(f"Receive error: {e}")
+    finally:
+        websocket_connected = False
 
 async def send_heartbeat(ws):
     try:
-        while not stop_streaming:
+        while not stop_streaming and websocket_connected:
             await asyncio.sleep(15)
             if websocket_connected:
-                await ws.send(json.dumps({'type': 'ping'}))
+                try:
+                    await ws.send(json.dumps({'type': 'ping'}))
+                except:
+                    break
     except:
         pass
 
@@ -723,29 +755,47 @@ async def websocket_session():
 
     ws_url = f"{API_URL}{WS_ENDPOINT}"
     print(f"🔌 Connecting: {ws_url}")
+    
+    # Event để đồng bộ khi server confirm connected
+    connection_ready_event = asyncio.Event()
 
     try:
-        async with websockets.connect(ws_url, ping_interval=30, ping_timeout=60) as ws:
+        async with websockets.connect(
+            ws_url, 
+            ping_interval=30, 
+            ping_timeout=60,
+            close_timeout=5
+        ) as ws:
             websocket_connected = True
-            current_state = State.CONNECTED  # Chờ user nhấn nút để ghi âm
+            current_state = State.CONNECTING  # Đang chờ server confirm
             reconnect_count = 0
+            
+            show_message(["🔌 Đang kết nối...", "", "Chờ server xác nhận"], (255, 255, 100))
 
-            show_message(["✅ Đã kết nối!", "", "Nhấn nút để", "bắt đầu ghi"], (100, 255, 100))
-
+            # Chạy các task song song, connection_ready_event sẽ được set khi nhận 'connected'
             await asyncio.gather(
-                stream_audio_to_server(ws),
-                receive_results(ws),
-                send_heartbeat(ws)
+                stream_audio_to_server(ws, connection_ready_event),
+                receive_results(ws, connection_ready_event),
+                send_heartbeat(ws),
+                return_exceptions=True
             )
 
-    except websockets.exceptions.ConnectionClosed:
-        print("🔌 Connection closed")
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(f"🔌 Connection closed: {e.code} - {e.reason}")
+        show_message(["Mất kết nối", f"Code: {e.code}"], (255, 100, 100))
+    except websockets.exceptions.InvalidStatusCode as e:
+        print(f"❌ Server rejected: {e.status_code}")
+        show_message(["Server từ chối!", f"HTTP {e.status_code}"], (255, 100, 100))
+    except ConnectionRefusedError:
+        print("❌ Connection refused - is server running?")
+        show_message(["Không thể kết nối!", "Server chưa chạy?"], (255, 100, 100))
     except Exception as e:
-        print(f"❌ Connection error: {e}")
+        print(f"❌ Connection error: {type(e).__name__}: {e}")
         show_message(["Lỗi kết nối!", str(e)[:20]], (255, 100, 100))
     finally:
         websocket_connected = False
         current_state = State.IDLE
+        print("🔌 WebSocket session ended")
 
 async def websocket_session_with_reconnect():
     global reconnect_count, stop_streaming
