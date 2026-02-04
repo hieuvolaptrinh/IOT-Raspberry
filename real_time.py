@@ -543,18 +543,6 @@ class VADAudioStreamer:
         """Check if in cooldown period after video playback."""
         return (time.time() - _playback_end_time) * 1000 < PLAYBACK_COOLDOWN_MS
 
-    def _calibrate_noise(self, rms: float):
-        """Calibrate noise floor from initial frames."""
-        if self._calibrated or self.in_speech:
-            return
-        self._noise_samples.append(rms)
-        if len(self._noise_samples) >= NOISE_CALIBRATION_FRAMES:
-            # Median for robustness
-            sorted_samples = sorted(self._noise_samples)
-            median = sorted_samples[len(sorted_samples) // 2]
-            self._noise_floor = max(80.0, min(median * 1.5, 400.0))
-            self._calibrated = True
-            print(f"🎚️ Noise floor: {self._noise_floor:.0f}")
 
     def process_frame(self, frame_bytes: bytes) -> bytes:
         self.frames_processed += 1
@@ -566,36 +554,56 @@ class VADAudioStreamer:
 
         rms = self._calculate_rms(frame_bytes)
 
-        # Calibrate noise floor
-        self._calibrate_noise(rms)
+        # Debug log mỗi 200 frames (~6s) - giảm spam
+        if self.frames_processed % 200 == 0:
+            print(f"🎤 RMS={rms:.0f} | floor={self._noise_floor:.0f} | calibrated={self._calibrated}")
 
-        # Skip silence/clipping
-        if rms < 10 or rms > MAX_RMS_THRESHOLD:
+        # Calibrate noise floor TRƯỚC khi skip (kể cả frames thấp)
+        if not self._calibrated and not self.in_speech:
+            self._noise_samples.append(rms)
+            if len(self._noise_samples) >= NOISE_CALIBRATION_FRAMES:
+                sorted_samples = sorted(self._noise_samples)
+                median = sorted_samples[len(sorted_samples) // 2]
+                # Nhân 1.3 thay vì 1.5 để nhạy hơn
+                self._noise_floor = max(50.0, min(median * 1.3, 300.0))
+                self._calibrated = True
+                print(f"🎚️ Noise floor calibrated: {self._noise_floor:.0f} (median={median:.0f})")
+
+        # Skip silence hoàn toàn (threshold thấp hơn: 5 thay vì 10)
+        if rms < 5:
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
             return b''
 
-        # Dynamic threshold
-        threshold = self._noise_floor if self._calibrated else MIN_RMS_THRESHOLD
+        # Skip clipping
+        if rms > MAX_RMS_THRESHOLD:
+            return b''
+
+        # Dynamic threshold - nhạy hơn khi không có VAD
+        if self._calibrated:
+            threshold = self._noise_floor
+        else:
+            # Chưa calibrate: dùng threshold thấp hơn khi không có VAD
+            threshold = MIN_RMS_THRESHOLD * 0.7 if not self.vad else MIN_RMS_THRESHOLD
 
         # VAD decision
         is_speech = False
         if self.vad:
             try:
                 is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
-                # Double-check với RMS để giảm false positive
-                if is_speech and rms < threshold * 0.8:
+                if is_speech and rms < threshold * 0.7:
                     is_speech = False
             except:
                 is_speech = rms > threshold
         else:
+            # Không có VAD: chỉ dựa vào RMS
             is_speech = rms > threshold
 
         if is_speech:
             if not self.in_speech:
                 self.in_speech = True
                 self.speech_frame_count = 0
-                # Add preroll
+                print(f"🎙️ Speech START (rms={rms:.0f}, threshold={threshold:.0f})")
                 for pf in self.preroll_buffer:
                     self.speech_buffer.extend(pf)
                 self.preroll_buffer.clear()
@@ -604,7 +612,6 @@ class VADAudioStreamer:
             self.speech_frame_count += 1
             self.hangover_counter = HANGOVER_FRAMES
 
-            # Max duration
             if self.speech_frame_count >= int(self.MAX_SPEECH_SECONDS * 1000 / FRAME_DURATION_MS):
                 return self._flush()
         else:
@@ -660,15 +667,13 @@ async def stream_audio_to_server(ws):
     streamer = VADAudioStreamer()
     frame_bytes = FRAME_SIZE * 2  # 16-bit
 
-    print(f"🎤 Starting VAD audio stream (frame={FRAME_DURATION_MS}ms)")
+    print(f"🎤 Starting audio stream (frame={FRAME_DURATION_MS}ms)")
 
     process = subprocess.Popen([
         'arecord', '-D', AUDIO_DEVICE,
         '-f', 'S16_LE', '-r', str(SAMPLE_RATE),
         '-c', str(CHANNELS), '-t', 'raw', '-'
-    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 4)
-
-    pending_queue = queue.Queue(maxsize=MAX_PENDING_BATCHES)
+    ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_bytes * 2)
 
     try:
         while not stop_streaming:
@@ -676,50 +681,32 @@ async def stream_audio_to_server(ws):
             if not frame or len(frame) < frame_bytes:
                 break
 
-            # 🔇 BLOCK AUDIO khi đang phát video để tránh thu âm thanh từ loa
-            is_video = (current_state == State.PLAYING)
-            if is_video:
-                await asyncio.sleep(0.001)
+            # Block audio khi đang phát video
+            if current_state == State.PLAYING:
                 continue
 
             speech_data = streamer.process_frame(frame)
 
+            # Gửi ngay khi có speech data (không cần queue)
             if speech_data:
-                if pending_queue.full():
-                    try:
-                        pending_queue.get_nowait()
-                    except:
-                        pass
-                pending_queue.put(speech_data)
-                streamer.mark_batch_sent()
-
-            if streamer.should_send_batch(is_video):
                 try:
-                    while not pending_queue.empty():
-                        data = pending_queue.get_nowait()
-                        await ws.send(data)
-                except:
-                    pass
-
-            await asyncio.sleep(0.001)
+                    await ws.send(speech_data)
+                except Exception as e:
+                    print(f"❌ Send error: {e}")
+                    break
 
     finally:
+        # Flush remaining
         try:
-            # flush remaining segment
             remain = streamer.flush()
             if remain:
                 await ws.send(remain)
+            await ws.send(json.dumps({'type': 'flush'}))
         except:
             pass
 
         process.terminate()
         process.wait()
-
-        try:
-            await ws.send(json.dumps({'type': 'flush'}))
-        except:
-            pass
-
         print(f"🎤 Stream ended: {streamer.get_stats()}")
 
 async def receive_results(ws):
