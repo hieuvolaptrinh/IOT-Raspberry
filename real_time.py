@@ -828,12 +828,11 @@ def handle_button():
         show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
         return
 
-    # === STATE: RECORDING → IDLE (Dừng hoàn toàn) ===
+    # === STATE: RECORDING → CONNECTED (Dừng ghi, giữ kết nối) ===
     if current_state == State.RECORDING:
-        print("⏹️ Stop recording...")
-        stop_streaming = True
+        print("⏹️ Stop recording, keep connection...")
         stop_video = True
-        current_state = State.IDLE
+        current_state = State.CONNECTED
         
         # Clear video queue
         while not video_queue.empty():
@@ -843,7 +842,7 @@ def handle_button():
             except:
                 break
         
-        show_message(["Đã dừng", "", "Nhấn nút để", "kết nối lại"], (100, 255, 100))
+        show_message(["⏸️ Đã tạm dừng", "", "Nhấn nút để", "ghi tiếp"], (100, 255, 100))
         return
 
 # ============ MAIN ============
