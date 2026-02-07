@@ -30,7 +30,7 @@ except ImportError:
 
 # ============ LOAD .ENV ============
 load_dotenv()
-_api_url = os.getenv("API_URL", "ws://172.20.10.3:8000")
+_api_url = os.getenv("API_URL", "ws://172.20.10.11:8000")
 
 # Auto-convert http:// to ws://
 if _api_url.startswith("http://"):
