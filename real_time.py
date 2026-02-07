@@ -19,6 +19,8 @@ from collections import deque
 from pathlib import Path
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
+from dataclasses import dataclass
+from typing import List, Optional
 
 # WebRTC VAD for speech detection
 try:
@@ -364,9 +366,27 @@ class VideoMapper:
 
 video_mapper = VideoMapper(VIDEO_DIR)
 
-# ============ VIDEO PLAYBACK ============
-video_queue = queue.Queue(maxsize=3)  # Chỉ giữ 3 response mới nhất
+# ============ VIDEO JOB & QUEUE ============
+@dataclass
+class VideoJob:
+    """Đóng gói một job phát video."""
+    words: List[str]
+    transcript: str
+    vsl_text: str = ""
+    confidence: float = 0.0
+
+# Pending queue: maxlen=3 tự động drop oldest
+pending_video_queue = deque(maxlen=3)
+video_queue_lock = threading.Condition()
 video_thread_running = True
+currently_playing_job = None  # Job đang phát (KHÔNG tính vào pending)
+
+def enqueue_video_job(job: VideoJob):
+    """Thêm job vào pending queue. Tự động drop oldest nếu đầy (maxlen=3)."""
+    with video_queue_lock:
+        pending_video_queue.append(job)  # deque tự drop left nếu maxlen exceeded
+        video_queue_lock.notify()  # Wake up worker
+        print(f"📥 Enqueued: {job.words[:3] if len(job.words) > 3 else job.words}... | Pending: {len(pending_video_queue)}")
 
 def play_single_video(video_path: str, overlay_word: str = "", max_duration: float = 10.0, speed_multiplier: float = 1.0):
     """
@@ -428,60 +448,76 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
         cap.release()
 
 def video_playback_worker():
-    global video_thread_running, current_state, stop_video
+    """✅ Worker thread: lấy job từ pending queue và phát video (độc lập với websocket)."""
+    global video_thread_running, current_state, stop_video, currently_playing_job
+    
     while video_thread_running:
-        try:
-            task = video_queue.get(timeout=0.5)
-            if task is None:
-                continue
-
-            words, transcript = task
+        job = None
+        
+        # ✅ Wait for job từ pending queue
+        with video_queue_lock:
+            while len(pending_video_queue) == 0 and video_thread_running:
+                video_queue_lock.wait(timeout=0.5)
             
-            # 🔇 Chuyển sang PLAYING trước khi phát để block audio
+            if not video_thread_running:
+                break
+            
+            if len(pending_video_queue) > 0:
+                job = pending_video_queue.popleft()  # ✅ Remove từ pending
+                currently_playing_job = job
+        
+        if job is None:
+            continue
+        
+        try:
+            # Set state PLAYING
             current_state = State.PLAYING
             stop_video = False
             
-            # Delay nhỏ để đảm bảo audio stream đã block
-            time.sleep(0.1)
-
-            for word in words:
+            print(f"🎬 Playing: {job.words} | Remaining pending: {len(pending_video_queue)}")
+            
+            # Phát từng video
+            for word in job.words:
                 if stop_video:
                     break
+                    
                 video_path = video_mapper.find_video(word)
                 if video_path:
-                    play_single_video(str(video_path), transcript, speed_multiplier=VIDEO_SPEED)
+                    play_single_video(
+                        str(video_path),
+                        overlay_word=word,
+                        speed_multiplier=VIDEO_SPEED
+                    )
                 else:
+                    # Fingerspell fallback
                     letters = video_mapper.get_fingerspell_videos(word)
                     if letters:
-                        for letter, lv in letters:
+                        for letter, letter_video in letters:
                             if stop_video:
                                 break
-                            play_single_video(str(lv), transcript, speed_multiplier=FINGERSPELL_SPEED)
-
-            # 🎤 Trigger cooldown + TỰ ĐỘNG tiếp tục ghi âm
-            signal_playback_ended()
-            current_state = State.RECORDING
-            stop_video = False
-            video_queue.task_done()
+                            play_single_video(
+                                str(letter_video),
+                                overlay_word=word,
+                                speed_multiplier=FINGERSPELL_SPEED
+                            )
             
-            # Hiển thị sẵn sàng nghe tiếp
-            show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
-
-        except queue.Empty:
-            continue
+            # ✅ Signal kết thúc phát video (cho UI)
+            signal_playback_ended()
+            
+            # ✅ Về RECORDING nếu vẫn đang recording mode
+            if not stop_video and is_recording:
+                current_state = State.RECORDING
+                show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+        
         except Exception as e:
-            print(f"Video error: {e}")
+            print(f"❌ Video worker error: {e}")
+        finally:
+            currently_playing_job = None
 
-def play_video_sequence(words: list, transcript: str = ""):
-    """Add video sequence to queue. Drop oldest if full (max 3)."""
-    if video_queue.full():
-        try:
-            old = video_queue.get_nowait()
-            video_queue.task_done()
-            print(f"⚠️ Queue full, dropped: {old[0][:2]}...")
-        except:
-            pass
-    video_queue.put((words, transcript))
+def play_video_sequence(words: list, transcript: str = "", vsl_text: str = "", confidence: float = 0.0):
+    """✅ [BACKWARD COMPAT] Wrapper cho enqueue_video_job()."""
+    job = VideoJob(words=words, transcript=transcript, vsl_text=vsl_text, confidence=confidence)
+    enqueue_video_job(job)
 
 video_thread = threading.Thread(target=video_playback_worker, daemon=True)
 video_thread.start()
@@ -527,18 +563,11 @@ class VADAudioStreamer:
         samples = np.frombuffer(audio_bytes, dtype=np.int16)
         return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
-    def _is_in_cooldown(self) -> bool:
-        """Check if in cooldown period after video playback."""
-        return (time.time() - _playback_end_time) * 1000 < PLAYBACK_COOLDOWN_MS
-
-
     def process_frame(self, frame_bytes: bytes) -> bytes:
         self.frames_processed += 1
 
-        # Skip during cooldown (echo prevention)
-        if self._is_in_cooldown():
-            self.preroll_buffer.append(frame_bytes)
-            return b''
+        # ❌ REMOVED COOLDOWN: Audio stream phải luôn chạy, kể cả khi phát video
+        # Backend sẽ lo AEC/echo cancellation nếu cần
 
         rms = self._calculate_rms(frame_bytes)
 
@@ -688,92 +717,86 @@ async def stream_audio_to_server(ws):
         print(f"🎤 Stream ended: {streamer.get_stats()}")
 
 async def receive_results(ws):
-    """Receive results and play videos directly (blocking but simple)."""
+    """✅ Receive results và CHỈ enqueue job. KHÔNG phát video ở đây (avoid blocking)."""
     global current_state, stop_streaming, websocket_connected
 
     try:
         async for message in ws:
-            data = json.loads(message)
-            msg_type = data.get('type', '')
+            if stop_streaming:
+                break
 
-            if msg_type == 'connected':
-                print(f"✅ Connected: {data.get('message', '')}")
-                current_state = State.RECORDING
-                show_message(["🔴 ĐANG GHI ÂM", "", "Nói vào micro...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+            try:
+                data = json.loads(message)
+                msg_type = data.get('type', '')
 
-            elif msg_type == 'buffering':
-                progress = data.get('progress', 0)
-                print(f"   Buffering: {progress*100:.0f}%")
+                if msg_type == 'connected':
+                    websocket_connected = True
+                    print(f"✅ Connected: {data.get('message', '')}")
+                    current_state = State.RECORDING
+                    show_message(["🔴 ĐANG GHI ÂM", "", "Nói vào micro...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
 
-            elif msg_type == 'result':
-                transcript = data.get('transcript', '')
-                words = data.get('words', [])
-                vsl_text = data.get('vsl_text', '')
-                confidence = data.get('confidence', 0)
-                
-                print(f"📝 Transcript: {transcript}")
-                print(f"   VSL Text: {vsl_text}")
-                print(f"   Confidence: {confidence:.2f}")
-                
-                if words:
-                    # Phát video trực tiếp - không dùng queue
-                    play_video_sequence_direct(words, transcript)
+                elif msg_type == 'buffering':
+                    progress = data.get('progress', 0)
+                    print(f"   📊 Buffering: {progress*100:.0f}%")
 
-            elif msg_type == 'filtered':
-                print(f"🔇 Filtered: {data.get('reason', '')}")
+                elif msg_type == 'result':
+                    transcript = data.get('transcript', '')
+                    words = data.get('words', [])
+                    vsl_text = data.get('vsl_text', '')
+                    confidence = data.get('confidence', 0)
+                    
+                    print(f"📝 Result: {transcript} → {words}")
+                    print(f"   VSL: {vsl_text} | Conf: {confidence:.2f}")
+                    
+                    if words:
+                        # ✅ CHỈ enqueue, KHÔNG block receive loop
+                        job = VideoJob(
+                            words=words,
+                            transcript=transcript,
+                            vsl_text=vsl_text,
+                            confidence=confidence
+                        )
+                        enqueue_video_job(job)
+                    else:
+                        print(f"⚠️ Empty words: {transcript}")
 
-            elif msg_type == 'error':
-                print(f"❌ Server error: {data.get('error', '')}")
-                show_message(["Lỗi!", data.get('error', '')[:20]], (255, 100, 100))
+                elif msg_type == 'filtered':
+                    reason = data.get('reason', 'unknown')
+                    transcript = data.get('transcript', '')
+                    print(f"🚫 Filtered: {transcript} ({reason})")
+                    # Brief non-blocking message
+                    if current_state == State.RECORDING:
+                        show_message(["🚫 ĐÃ LỌC", "", transcript[:30], f"({reason})"], (255, 200, 0), (50, 30, 0))
+                        await asyncio.sleep(1.0)
+                        if current_state == State.RECORDING:  # Re-check
+                            show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
 
-            elif msg_type == 'pong':
-                pass
+                elif msg_type == 'error':
+                    error_msg = data.get('error', 'Unknown error')
+                    print(f"❌ Server error: {error_msg}")
+                    show_message(["❌ Lỗi", "", error_msg[:30]], (255, 100, 100))
 
-            # Free memory
-            del data, message
+                elif msg_type == 'pong':
+                    pass  # Heartbeat response
+
+                # Free memory
+                del data
+
+            except json.JSONDecodeError as e:
+                print(f"❌ JSON decode error: {e}")
+            except Exception as e:
+                print(f"❌ Message handling error: {e}")
 
     except websockets.exceptions.ConnectionClosed as e:
         print(f"🔌 Connection closed: {e.code if hasattr(e, 'code') else 'unknown'}")
     except Exception as e:
-        print(f"Receive error: {e}")
+        print(f"❌ Receive error: {e}")
     finally:
         websocket_connected = False
 
-def play_video_sequence_direct(words: list, transcript: str = ""):
-    """
-    Phát video trực tiếp - giữ 3 response mới nhất.
-    Đơn giản hơn queue thread.
-    """
-    global current_state, stop_video
-    
-    current_state = State.PLAYING
-    stop_video = False
-    
-    print(f"🎬 Playing: {words}")
-    
-    for word in words:
-        if stop_video:
-            break
-        
-        video_path = video_mapper.find_video(word)
-        
-        if video_path:
-            print(f"   ▶ {word} → {video_path.name}")
-            play_single_video(str(video_path), transcript, speed_multiplier=VIDEO_SPEED)
-        else:
-            # Fingerspell fallback
-            letters = video_mapper.get_fingerspell_videos(word)
-            if letters:
-                print(f"   🔤 Fingerspelling: {word}")
-                for letter, letter_video in letters:
-                    if stop_video:
-                        break
-                    play_single_video(str(letter_video), transcript, speed_multiplier=FINGERSPELL_SPEED)
-    
-    # Quay lại recording
-    current_state = State.RECORDING
-    stop_video = False
-    show_message(["🔴 ĐANG GHI ÂM", "", "Nói vào micro...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+# ❌ REMOVED: play_video_sequence_direct()
+# Lý do: Function này BLOCK receive_results loop → không nhận result mới khi phát video
+# ✅ Thay bằng: enqueue_video_job() + video_playback_worker() thread độc lập
 
 async def send_heartbeat(ws):
     """Send periodic heartbeat."""
@@ -879,13 +902,10 @@ def handle_button():
     if current_state == State.PLAYING:
         print("⏹️ Stopping video...")
         stop_video = True
-        # Clear video queue
-        while not video_queue.empty():
-            try:
-                video_queue.get_nowait()
-                video_queue.task_done()
-            except:
-                break
+        # ✅ Clear pending queue
+        with video_queue_lock:
+            pending_video_queue.clear()
+            print(f"🧹 Cleared pending queue")
         return
 
     # === Toggle recording ===
@@ -910,13 +930,10 @@ def handle_button():
         stop_streaming = True
         stop_video = True
 
-        # Clear video queue
-        while not video_queue.empty():
-            try:
-                video_queue.get_nowait()
-                video_queue.task_done()
-            except:
-                break
+        # ✅ Clear pending queue
+        with video_queue_lock:
+            pending_video_queue.clear()
+            print(f"🧹 Cleared pending queue")
 
         current_state = State.IDLE
         show_message(["Đã dừng ghi âm", "", "Nhấn nút để", "ghi lại"], (100, 255, 100))
@@ -925,9 +942,6 @@ def handle_button():
 def main():
     global current_state
 
-    print("=" * 50)
-    print("🎤 REAL-TIME VSL - Raspberry Pi (SENSITIVE)")
-    print("=" * 50)
     print(f"📡 Server: {API_URL}")
     print(f"📹 Videos: {len(video_mapper.video_cache)}")
     print(f"🎙️ VAD: {'ENABLED' if VAD_AVAILABLE else 'DISABLED (RMS only)'}")
