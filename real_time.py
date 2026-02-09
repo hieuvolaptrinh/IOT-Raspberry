@@ -62,13 +62,12 @@ PREROLL_FRAMES = 10                    # 300ms - đủ để không cắt đầu
 HANGOVER_FRAMES = 15                   # 450ms - giảm gộp noise
 MIN_SPEECH_FRAMES = 7                  # 210ms - tránh segment quá ngắn
 
-SEND_INTERVAL_NORMAL = 0.05
-SEND_INTERVAL_VIDEO = 0.1
+# NOTE: SEND_INTERVAL_* removed - no longer needed, always send immediately
 
 MIN_RMS_THRESHOLD = 120                # cân bằng
 MAX_RMS_THRESHOLD = 32000
 
-PLAYBACK_COOLDOWN_MS = 500             # cooldown sau video
+# NOTE: Cooldown removed - audio stream always runs regardless of video playback
 NOISE_CALIBRATION_FRAMES = 50          # ~1.5s calibration
 
 MAX_PENDING_BATCHES = 5
@@ -227,16 +226,52 @@ def _create_text_overlay(text: str) -> np.ndarray:
     
     x = max(5, (240 - text_width) // 2)
     draw.text((x, 10), text, font=FONT_VN, fill=(255, 255, 255))
-    
+
     # Convert to BGR numpy array
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-def show_frame(frame, overlay_text=None):
+def show_frame(frame, overlay_text=None, show_recent_results=True):
+    """
+    Hiển thị frame lên LCD với:
+    - overlay_text: từ đang phát (bottom 40px)
+    - show_recent_results: 3 transcript mới nhất (top-left corner)
+    """
     global _display_buffer, _rgb565_buffer
 
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
 
-    # Composite overlay
+    # ===== RENDER 3 RECENT RESULTS (góc trên trái) =====
+    if show_recent_results:
+        try:
+            with recent_results_lock:
+                results_list = list(recent_results)
+            
+            if results_list:
+                # Tạo semi-transparent overlay cho text
+                overlay_h = min(len(results_list) * 20 + 10, 70)
+                
+                # Darken top area for readability
+                frame[0:overlay_h, :] = (frame[0:overlay_h, :] * 0.4).astype(np.uint8)
+                
+                # Render text trực tiếp bằng OpenCV (nhanh hơn PIL)
+                y = 18
+                for i, text in enumerate(results_list):
+                    # Truncate và thêm số thứ tự
+                    display_text = f"{i+1}. {text[:22]}"
+                    if len(text) > 22:
+                        display_text += "..."
+                    
+                    # Màu: mới nhất = vàng sáng, cũ hơn = nhạt dần
+                    brightness = 255 - (len(results_list) - 1 - i) * 60
+                    color = (0, brightness, brightness)  # BGR: cyan/yellow tones
+                    
+                    cv2.putText(frame, display_text, (5, y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+                    y += 20
+        except Exception as e:
+            pass  # Không block video nếu render lỗi
+
+    # ===== RENDER OVERLAY TEXT (từ đang phát - bottom) =====
     if overlay_text:
         overlay = _create_text_overlay(overlay_text)
         frame[200:240, :] = overlay  # Dán overlay vào bottom 40px
@@ -262,7 +297,8 @@ def show_frame(frame, overlay_text=None):
     cmd(0x2C)
     data_bulk(_display_buffer.tobytes())
 
-def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0)):
+def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0), show_recent=True):
+    """Hiển thị message full-screen với option hiển thị recent results."""
     pil_img = Image.new('RGB', (240, 240), bg_color)
     draw = ImageDraw.Draw(pil_img)
 
@@ -280,7 +316,7 @@ def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0)):
         draw.text((x, y), line, font=FONT_VN, fill=color)
 
     frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    show_frame(frame)
+    show_frame(frame, show_recent_results=show_recent)
 
 # ============ VIDEO MAPPER ============
 class VideoMapper:
@@ -380,6 +416,10 @@ pending_video_queue = deque(maxlen=3)
 video_queue_lock = threading.Condition()
 video_thread_running = True
 currently_playing_job = None  # Job đang phát (KHÔNG tính vào pending)
+
+# ============ RECENT RESULTS QUEUE (3 mới nhất) ============
+recent_results = deque(maxlen=3)  # Lưu 3 transcript mới nhất để hiển thị
+recent_results_lock = threading.Lock()
 
 def enqueue_video_job(job: VideoJob):
     """Thêm job vào pending queue. Tự động drop oldest nếu đầy (maxlen=3)."""
@@ -501,8 +541,7 @@ def video_playback_worker():
                                 speed_multiplier=FINGERSPELL_SPEED
                             )
             
-            # ✅ Signal kết thúc phát video (cho UI)
-            signal_playback_ended()
+            # NOTE: signal_playback_ended() removed - no cooldown needed
             
             # ✅ Về RECORDING nếu vẫn đang recording mode
             if not stop_video and is_recording:
@@ -522,13 +561,7 @@ def play_video_sequence(words: list, transcript: str = "", vsl_text: str = "", c
 video_thread = threading.Thread(target=video_playback_worker, daemon=True)
 video_thread.start()
 
-# ============ COOLDOWN SIGNAL (global) ============
-_playback_end_time = 0.0
-
-def signal_playback_ended():
-    """Gọi khi video playback kết thúc để trigger cooldown."""
-    global _playback_end_time
-    _playback_end_time = time.time()
+# NOTE: Cooldown signal removed - no longer needed since audio stream runs continuously
 
 # ============ VAD-BASED AUDIO STREAMING (OPTIMIZED) ============
 class VADAudioStreamer:
@@ -550,7 +583,6 @@ class VADAudioStreamer:
         self.in_speech = False
         self.hangover_counter = 0
         self.speech_frame_count = 0
-        self.last_send_time = time.time()
 
         # Stats
         self.frames_processed = 0
@@ -643,13 +675,6 @@ class VADAudioStreamer:
         self.speech_buffer = bytearray()
         self.speech_frame_count = 0
         return result
-
-    def should_send_batch(self, is_video_playing: bool = False) -> bool:
-        interval = SEND_INTERVAL_VIDEO if is_video_playing else SEND_INTERVAL_NORMAL
-        return (time.time() - self.last_send_time) >= interval
-
-    def mark_batch_sent(self):
-        self.last_send_time = time.time()
 
     def flush(self) -> bytes:
         """Force flush remaining buffer."""
@@ -757,6 +782,14 @@ async def receive_results(ws):
                             confidence=confidence
                         )
                         enqueue_video_job(job)
+                        
+                        # ✅ Thêm vào recent_results để hiển thị trên LCD
+                        with recent_results_lock:
+                            # Lưu transcript ngắn gọn (max 25 ký tự)
+                            short_text = transcript[:25] if transcript else vsl_text[:25]
+                            if short_text:
+                                recent_results.append(short_text)
+                                print(f"📺 Recent results: {list(recent_results)}")
                     else:
                         print(f"⚠️ Empty words: {transcript}")
 
@@ -767,9 +800,7 @@ async def receive_results(ws):
                     # Brief non-blocking message
                     if current_state == State.RECORDING:
                         show_message(["🚫 ĐÃ LỌC", "", transcript[:30], f"({reason})"], (255, 200, 0), (50, 30, 0))
-                        await asyncio.sleep(1.0)
-                        if current_state == State.RECORDING:  # Re-check
-                            show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+                        # NOTE: No sleep here - don't block receive loop
 
                 elif msg_type == 'error':
                     error_msg = data.get('error', 'Unknown error')
@@ -934,9 +965,14 @@ def handle_button():
         with video_queue_lock:
             pending_video_queue.clear()
             print(f"🧹 Cleared pending queue")
+        
+        # ✅ Clear recent results để không hiển thị kết quả cũ
+        with recent_results_lock:
+            recent_results.clear()
+            print(f"🧹 Cleared recent results")
 
         current_state = State.IDLE
-        show_message(["Đã dừng ghi âm", "", "Nhấn nút để", "ghi lại"], (100, 255, 100))
+        show_message(["Đã dừng ghi âm", "", "Nhấn nút để", "ghi lại"], (100, 255, 100), show_recent=False)
 
 # ============ MAIN ============
 def main():
