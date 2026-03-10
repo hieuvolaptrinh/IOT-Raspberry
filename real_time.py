@@ -526,6 +526,9 @@ def video_playback_worker():
             
             print(f"🎬 Playing: {job.words} | Remaining pending: {len(pending_video_queue)}")
             
+            # Text hiển thị ở bottom: cả câu response
+            response_text = job.vsl_text or job.transcript or ""
+            
             # Phát từng video
             for word in job.words:
                 if stop_video:
@@ -535,7 +538,7 @@ def video_playback_worker():
                 if video_path:
                     play_single_video(
                         str(video_path),
-                        overlay_word=word,
+                        overlay_word=response_text,
                         speed_multiplier=VIDEO_SPEED
                     )
                 else:
@@ -547,7 +550,7 @@ def video_playback_worker():
                                 break
                             play_single_video(
                                 str(letter_video),
-                                overlay_word=word,
+                                overlay_word=response_text,
                                 speed_multiplier=FINGERSPELL_SPEED
                             )
             
