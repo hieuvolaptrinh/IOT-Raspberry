@@ -248,26 +248,30 @@ def show_frame(frame, overlay_text=None, show_recent_results=True):
             
             if results_list:
                 # Tạo semi-transparent overlay cho text
-                overlay_h = min(len(results_list) * 20 + 10, 70)
+                overlay_h = min(len(results_list) * 22 + 10, 80)
                 
                 # Darken top area for readability
                 frame[0:overlay_h, :] = (frame[0:overlay_h, :] * 0.4).astype(np.uint8)
                 
-                # Render text trực tiếp bằng OpenCV (nhanh hơn PIL)
-                y = 18
+                # Render text bằng PIL để hỗ trợ tiếng Việt
+                pil_overlay = Image.fromarray(cv2.cvtColor(frame[0:overlay_h, :], cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_overlay)
+                
+                y = 4
                 for i, text in enumerate(results_list):
-                    # Truncate và thêm số thứ tự
                     display_text = f"{i+1}. {text[:22]}"
                     if len(text) > 22:
                         display_text += "..."
                     
                     # Màu: mới nhất = vàng sáng, cũ hơn = nhạt dần
                     brightness = 255 - (len(results_list) - 1 - i) * 60
-                    color = (0, brightness, brightness)  # BGR: cyan/yellow tones
+                    color = (brightness, brightness, 0)  # RGB: cyan/yellow tones
                     
-                    cv2.putText(frame, display_text, (5, y), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-                    y += 20
+                    draw.text((5, y), display_text, font=FONT_SMALL, fill=color)
+                    y += 22
+                
+                # Dán overlay lại vào frame
+                frame[0:overlay_h, :] = cv2.cvtColor(np.array(pil_overlay), cv2.COLOR_RGB2BGR)
         except Exception as e:
             pass  # Không block video nếu render lỗi
 
@@ -546,7 +550,7 @@ def video_playback_worker():
             # ✅ Về RECORDING nếu vẫn đang recording mode
             if not stop_video and is_recording:
                 current_state = State.RECORDING
-                show_message(["🔴 GHI ÂM", "", "Đang nghe...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+                # Giữ nguyên màn hình - không hiển thị gì thêm
         
         except Exception as e:
             print(f"❌ Video worker error: {e}")
@@ -758,7 +762,7 @@ async def receive_results(ws):
                     websocket_connected = True
                     print(f"✅ Connected: {data.get('message', '')}")
                     current_state = State.RECORDING
-                    show_message(["🔴 ĐANG GHI ÂM", "", "Nói vào micro...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+                    # Giữ nguyên màn hình - đang chờ kết quả
 
                 elif msg_type == 'buffering':
                     progress = data.get('progress', 0)
@@ -797,10 +801,7 @@ async def receive_results(ws):
                     reason = data.get('reason', 'unknown')
                     transcript = data.get('transcript', '')
                     print(f"🚫 Filtered: {transcript} ({reason})")
-                    # Brief non-blocking message
-                    if current_state == State.RECORDING:
-                        show_message(["🚫 ĐÃ LỌC", "", transcript[:30], f"({reason})"], (255, 200, 0), (50, 30, 0))
-                        # NOTE: No sleep here - don't block receive loop
+                    # Không hiển thị lên LCD - giữ nguyên màn hình
 
                 elif msg_type == 'error':
                     error_msg = data.get('error', 'Unknown error')
@@ -859,8 +860,7 @@ async def websocket_session():
             websocket_connected = True
             current_state = State.RECORDING
             reconnect_count = 0
-            
-            show_message(["🔴 ĐANG GHI ÂM", "", "Nói vào micro...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+            # Giữ nguyên màn hình chờ - không hiển thị trạng thái
 
             # Tạo tasks
             sender = asyncio.create_task(stream_audio_to_server(ws))
@@ -948,7 +948,7 @@ def handle_button():
         stop_video = False
         current_state = State.CONNECTING
 
-        show_message(["🔴 GHI ÂM", "", "Đang kết nối...", "Nhấn nút để dừng"], (255, 100, 100), (50, 0, 0))
+        show_message(["Đang kết nối...", "", "Vui lòng chờ"], (100, 200, 255), (0, 20, 50))
 
         # Start WebSocket in background thread
         ws_thread = threading.Thread(target=start_websocket_thread, daemon=True)
@@ -972,7 +972,7 @@ def handle_button():
             print(f"🧹 Cleared recent results")
 
         current_state = State.IDLE
-        show_message(["Đã dừng ghi âm", "", "Nhấn nút để", "ghi lại"], (100, 255, 100), show_recent=False)
+        show_message(["Đã dừng", "", "Nhấn nút để", "bắt đầu lại"], (100, 255, 100), show_recent=False)
 
 # ============ MAIN ============
 def main():
