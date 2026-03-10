@@ -513,6 +513,12 @@ def video_playback_worker():
         if job is None:
             continue
         
+        # ✅ Xóa khỏi recent_results vì đã bắt đầu phát video
+        with recent_results_lock:
+            short_text = job.transcript[:25] if job.transcript else job.vsl_text[:25]
+            if short_text and short_text in recent_results:
+                recent_results.remove(short_text)
+        
         try:
             # Set state PLAYING
             current_state = State.PLAYING
