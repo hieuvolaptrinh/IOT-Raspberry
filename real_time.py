@@ -72,6 +72,9 @@ NOISE_CALIBRATION_FRAMES = 50          # ~1.5s calibration
 
 MAX_PENDING_BATCHES = 5
 
+# ============ BUTTON SETTINGS ============
+STOP_DOUBLE_PRESS_WINDOW_SEC = 1.5
+
 # ============ DISPLAY SETTINGS ============
 MIRROR_MODE = True
 TARGET_LCD_FPS = 18  # Giới hạn LCD refresh rate
@@ -102,6 +105,8 @@ stop_video = False
 websocket_connected = False
 reconnect_count = 0
 ws_thread = None
+stop_armed = False
+stop_armed_at = 0.0
 
 # ============ AUDIO DEVICE ============
 def get_usb_audio_device():
@@ -389,6 +394,11 @@ currently_playing_job = None  # Job đang phát (KHÔNG tính vào pending)
 last_displayed_frame = None  # Giữ khung hình cuối cùng khi hết response
 last_displayed_frame_lock = threading.Lock()
 
+def clear_response_cache():
+    """Xóa cache hiển thị response đã qua."""
+    # Giữ nguyên khung hình cuối để hiển thị khi chưa có response mới
+    pass
+
 def enqueue_video_job(job: VideoJob):
     """Thêm job vào pending queue. Tự động drop oldest nếu đầy (maxlen=3)."""
     with video_queue_lock:
@@ -522,11 +532,6 @@ def video_playback_worker():
             # ✅ Về RECORDING nếu vẫn đang recording mode
             if not stop_video and is_recording:
                 current_state = State.RECORDING
-                # ✅ Giữ nguyên khung hình cuối cùng khi hết response
-                with last_displayed_frame_lock:
-                    if last_displayed_frame is not None:
-                        response_text = job.original_text or job.transcript or job.vsl_text or ""
-                        show_frame(last_displayed_frame, overlay_text=response_text)
         
         except Exception as e:
             print(f"❌ Video worker error: {e}")
@@ -890,13 +895,17 @@ def handle_button():
     """
     Simple toggle button flow:
     - Press 1: Connect + Start recording
-    - Press 2: Stop recording + Disconnect
+    - Press 2: Stop recording + Disconnect (double-press)
     - During video: Stop video
     """
-    global current_state, is_recording, stop_streaming, stop_video, ws_thread
+    global current_state, is_recording, stop_streaming, stop_video, ws_thread, stop_armed, stop_armed_at
 
     state_names = {0: 'IDLE', 1: 'CONNECTING', 2: 'RECORDING', 3: 'PLAYING'}
     print(f"🔘 Button! State: {state_names.get(current_state, current_state)}, Recording: {is_recording}")
+
+    # Reset stop arm if timeout
+    if stop_armed and (time.time() - stop_armed_at > STOP_DOUBLE_PRESS_WINDOW_SEC):
+        stop_armed = False
 
     # === Đang phát video → Dừng video ===
     if current_state == State.PLAYING:
@@ -916,6 +925,7 @@ def handle_button():
         stop_streaming = False
         stop_video = False
         current_state = State.CONNECTING
+        stop_armed = False
 
         show_message(["Đang kết nối...", "", "Vui lòng chờ"], (100, 200, 255), (0, 20, 50))
 
@@ -924,17 +934,23 @@ def handle_button():
         ws_thread.start()
 
     else:
-        # ===== STOP RECORDING =====
+        # ===== STOP RECORDING (DOUBLE PRESS) =====
+        if not stop_armed:
+            stop_armed = True
+            stop_armed_at = time.time()
+            show_message(["Nhấn lần nữa", "để dừng"], (255, 220, 120), show_recent=False)
+            return
+
         print("⏹️ Stopping recording...")
         is_recording = False
         stop_streaming = True
         stop_video = True
+        stop_armed = False
 
         # ✅ Clear pending queue
         with video_queue_lock:
             pending_video_queue.clear()
             print(f"🧹 Cleared pending queue")
-        
 
         current_state = State.IDLE
         show_message(["Đã dừng", "", "Nhấn nút để", "bắt đầu lại"], (100, 255, 100), show_recent=False)
