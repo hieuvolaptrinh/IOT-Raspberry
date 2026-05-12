@@ -60,7 +60,7 @@ FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 480 samples
 
 PREROLL_FRAMES = 12                    # 360ms - giữ nhiều context đầu
 HANGOVER_FRAMES = 20                   # 600ms - ít cắt giữa câu
-MIN_SPEECH_FRAMES = 5                  # 150ms - nhạy hơn
+MIN_SPEECH_FRAMES = 3                  # 90ms - nhạy hơn cho câu ngắn
 
 # NOTE: SEND_INTERVAL_* removed - no longer needed, always send immediately
 
@@ -233,48 +233,11 @@ def _create_text_overlay(text: str) -> np.ndarray:
 def show_frame(frame, overlay_text=None, show_recent_results=True):
     """
     Hiển thị frame lên LCD với:
-    - overlay_text: từ đang phát (bottom 40px)
-    - show_recent_results: 3 transcript mới nhất (top-left corner)
+    - overlay_text: câu đang phát (bottom 40px)
     """
     global _display_buffer, _rgb565_buffer
 
     frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
-
-    # ===== RENDER 3 RECENT RESULTS (góc trên trái) =====
-    if show_recent_results:
-        try:
-            with recent_results_lock:
-                results_list = list(recent_results)
-            
-            if results_list:
-                # Tạo semi-transparent overlay cho text
-                overlay_h = min(len(results_list) * 22 + 10, 80)
-                
-                # Darken top area for readability
-                frame[0:overlay_h, :] = (frame[0:overlay_h, :] * 0.4).astype(np.uint8)
-                
-                # Render text bằng PIL để hỗ trợ tiếng Việt
-                pil_overlay = Image.fromarray(cv2.cvtColor(frame[0:overlay_h, :], cv2.COLOR_BGR2RGB))
-                draw = ImageDraw.Draw(pil_overlay)
-                
-                y = 4
-                for i, text in enumerate(results_list):
-                    # Hiển thị câu response (cắt vừa màn hình)
-                    display_text = f"{i+1}. {text[:28]}"
-                    if len(text) > 28:
-                        display_text += "…"
-                    
-                    # Màu: mới nhất = vàng sáng, cũ hơn = nhạt dần
-                    brightness = 255 - (len(results_list) - 1 - i) * 60
-                    color = (brightness, brightness, 0)  # RGB: cyan/yellow tones
-                    
-                    draw.text((5, y), display_text, font=FONT_SMALL, fill=color)
-                    y += 22
-                
-                # Dán overlay lại vào frame
-                frame[0:overlay_h, :] = cv2.cvtColor(np.array(pil_overlay), cv2.COLOR_RGB2BGR)
-        except Exception as e:
-            pass  # Không block video nếu render lỗi
 
     # ===== RENDER OVERLAY TEXT (từ đang phát - bottom) =====
     if overlay_text:
@@ -303,7 +266,7 @@ def show_frame(frame, overlay_text=None, show_recent_results=True):
     data_bulk(_display_buffer.tobytes())
 
 def show_message(lines, color=(255, 255, 255), bg_color=(0, 0, 0), show_recent=True):
-    """Hiển thị message full-screen với option hiển thị recent results."""
+    """Hiển thị message full-screen."""
     pil_img = Image.new('RGB', (240, 240), bg_color)
     draw = ImageDraw.Draw(pil_img)
 
@@ -415,6 +378,7 @@ class VideoJob:
     transcript: str
     vsl_text: str = ""
     confidence: float = 0.0
+    original_text: str = ""
 
 # Pending queue: maxlen=3 tự động drop oldest
 pending_video_queue = deque(maxlen=3)
@@ -422,9 +386,6 @@ video_queue_lock = threading.Condition()
 video_thread_running = True
 currently_playing_job = None  # Job đang phát (KHÔNG tính vào pending)
 
-# ============ RECENT RESULTS QUEUE (3 response gần nhất) ============
-recent_results = deque(maxlen=3)  # Lưu 3 response (câu) gần nhất từ BE
-recent_results_lock = threading.Lock()
 last_displayed_frame = None  # Giữ khung hình cuối cùng khi hết response
 last_displayed_frame_lock = threading.Lock()
 
@@ -521,8 +482,6 @@ def video_playback_worker():
         if job is None:
             continue
         
-        # ✅ Giữ nguyên recent_results - không xóa khi phát, để hiển thị 3 response gần nhất
-        
         try:
             # Set state PLAYING
             current_state = State.PLAYING
@@ -531,7 +490,7 @@ def video_playback_worker():
             print(f"🎬 Playing: {job.words} | Remaining pending: {len(pending_video_queue)}")
             
             # Text hiển thị ở bottom: cả câu response
-            response_text = job.vsl_text or job.transcript or ""
+            response_text = job.original_text or job.transcript or job.vsl_text or ""
             
             # Phát từng video
             for word in job.words:
@@ -566,7 +525,7 @@ def video_playback_worker():
                 # ✅ Giữ nguyên khung hình cuối cùng khi hết response
                 with last_displayed_frame_lock:
                     if last_displayed_frame is not None:
-                        response_text = job.vsl_text or job.transcript or ""
+                        response_text = job.original_text or job.transcript or job.vsl_text or ""
                         show_frame(last_displayed_frame, overlay_text=response_text)
         
         except Exception as e:
@@ -574,9 +533,9 @@ def video_playback_worker():
         finally:
             currently_playing_job = None
 
-def play_video_sequence(words: list, transcript: str = "", vsl_text: str = "", confidence: float = 0.0):
+def play_video_sequence(words: list, transcript: str = "", vsl_text: str = "", original_text: str = "", confidence: float = 0.0):
     """✅ [BACKWARD COMPAT] Wrapper cho enqueue_video_job()."""
-    job = VideoJob(words=words, transcript=transcript, vsl_text=vsl_text, confidence=confidence)
+    job = VideoJob(words=words, transcript=transcript, vsl_text=vsl_text, original_text=original_text, confidence=confidence)
     enqueue_video_job(job)
 
 video_thread = threading.Thread(target=video_playback_worker, daemon=True)
@@ -595,8 +554,8 @@ class VADAudioStreamer:
     MAX_SPEECH_SECONDS = 8.0  # Giảm để tránh Whisper hallucinate
 
     def __init__(self):
-        # Mode 1 = moderate (nhạy hơn, chỉ bỏ noise vừa phải)
-        self.vad = webrtcvad.Vad(1) if VAD_AVAILABLE else None
+        # Mode 0 = least aggressive (giữ nhiều tiếng nói hơn)
+        self.vad = webrtcvad.Vad(0) if VAD_AVAILABLE else None
 
         self.preroll_buffer = deque(maxlen=PREROLL_FRAMES)
         self.speech_buffer = bytearray()
@@ -638,16 +597,16 @@ class VADAudioStreamer:
         if rms > MAX_RMS_THRESHOLD:
             return b''
 
-        # Threshold vừa phải - chỉ lọc noise nhẹ
-        threshold = 60  # Threshold thấp hơn → nhạy hơn
+        # Threshold nhạy hơn - giữ nhiều tiếng nói hơn
+        threshold = 30
 
         # VAD decision (moderate)
         is_speech = False
         if self.vad:
             try:
                 is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
-                # Chỉ reject nếu RMS cực thấp (< 30) - vừa phải
-                if is_speech and rms < 30:
+                # Chỉ reject nếu RMS cực thấp (< 20)
+                if is_speech and rms < 20:
                     is_speech = False
             except:
                 is_speech = rms > threshold
@@ -789,6 +748,7 @@ async def receive_results(ws):
                     transcript = data.get('transcript', '')
                     words = data.get('words', [])
                     vsl_text = data.get('vsl_text', '')
+                    original_text = data.get('original_text', '')
                     confidence = data.get('confidence', 0)
                     
                     print(f"📝 Result: {transcript} → {words}")
@@ -800,17 +760,11 @@ async def receive_results(ws):
                             words=words,
                             transcript=transcript,
                             vsl_text=vsl_text,
+                            original_text=original_text,
                             confidence=confidence
                         )
                         enqueue_video_job(job)
                         
-                        # ✅ Thêm vào recent_results để hiển thị trên LCD
-                        with recent_results_lock:
-                            # Lưu câu response đầy đủ (cả câu, không phải token)
-                            full_sentence = vsl_text if vsl_text else transcript
-                            if full_sentence:
-                                recent_results.append(full_sentence)
-                                print(f"📺 Recent results: {list(recent_results)}")
                     else:
                         print(f"⚠️ Empty words: {transcript}")
 
@@ -983,10 +937,6 @@ def handle_button():
             pending_video_queue.clear()
             print(f"🧹 Cleared pending queue")
         
-        # ✅ Clear recent results để không hiển thị kết quả cũ
-        with recent_results_lock:
-            recent_results.clear()
-            print(f"🧹 Cleared recent results")
 
         current_state = State.IDLE
         show_message(["Đã dừng", "", "Nhấn nút để", "bắt đầu lại"], (100, 255, 100), show_recent=False)
