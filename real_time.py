@@ -60,7 +60,7 @@ FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 480 samples
 
 PREROLL_FRAMES = 12                    # 360ms - giữ nhiều context đầu
 HANGOVER_FRAMES = 20                   # 600ms - ít cắt giữa câu
-MIN_SPEECH_FRAMES = 3                  # 90ms - nhạy hơn cho câu ngắn
+MIN_SPEECH_FRAMES = 2                  # 60ms - giữ nhiều đoạn ngắn hơn
 
 # NOTE: SEND_INTERVAL_* removed - no longer needed, always send immediately
 
@@ -587,8 +587,8 @@ class VADAudioStreamer:
         if self.frames_processed % 200 == 0:
             print(f"🎤 RMS={rms:.0f} | in_speech={self.in_speech}")
 
-        # Skip silence hoàn toàn (RMS < 3 = hoàn toàn im lặng)
-        if rms < 3:
+        # Skip silence hoàn toàn (RMS < 1 = gần như im lặng)
+        if rms < 1:
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
             return b''
@@ -598,16 +598,14 @@ class VADAudioStreamer:
             return b''
 
         # Threshold nhạy hơn - giữ nhiều tiếng nói hơn
-        threshold = 30
+        threshold = 10
 
         # VAD decision (moderate)
         is_speech = False
         if self.vad:
             try:
                 is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
-                # Chỉ reject nếu RMS cực thấp (< 20)
-                if is_speech and rms < 20:
-                    is_speech = False
+                # Không reject thêm để tránh mất tiếng với mic yếu
             except:
                 is_speech = rms > threshold
         else:
