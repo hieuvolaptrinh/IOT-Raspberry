@@ -51,20 +51,20 @@ FINGERSPELL_SPEED = 2.5
 RECONNECT_DELAY = 3
 MAX_RECONNECT_ATTEMPTS = 5
 
-# ============ VAD SETTINGS (BALANCED) ============
+# ============ VAD SETTINGS (MODERATE - chỉ bỏ noise vừa) ============
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
 FRAME_DURATION_MS = 30
 FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 480 samples
 
-PREROLL_FRAMES = 10                    # 300ms - đủ để không cắt đầu
-HANGOVER_FRAMES = 15                   # 450ms - giảm gộp noise
-MIN_SPEECH_FRAMES = 7                  # 210ms - tránh segment quá ngắn
+PREROLL_FRAMES = 12                    # 360ms - giữ nhiều context đầu
+HANGOVER_FRAMES = 20                   # 600ms - ít cắt giữa câu
+MIN_SPEECH_FRAMES = 5                  # 150ms - nhạy hơn
 
 # NOTE: SEND_INTERVAL_* removed - no longer needed, always send immediately
 
-MIN_RMS_THRESHOLD = 120                # cân bằng
+MIN_RMS_THRESHOLD = 80                 # nhạy hơn - chỉ lọc noise vừa
 MAX_RMS_THRESHOLD = 32000
 
 # NOTE: Cooldown removed - audio stream always runs regardless of video playback
@@ -259,9 +259,10 @@ def show_frame(frame, overlay_text=None, show_recent_results=True):
                 
                 y = 4
                 for i, text in enumerate(results_list):
-                    display_text = f"{i+1}. {text[:22]}"
-                    if len(text) > 22:
-                        display_text += "..."
+                    # Hiển thị câu response (cắt vừa màn hình)
+                    display_text = f"{i+1}. {text[:28]}"
+                    if len(text) > 28:
+                        display_text += "…"
                     
                     # Màu: mới nhất = vàng sáng, cũ hơn = nhạt dần
                     brightness = 255 - (len(results_list) - 1 - i) * 60
@@ -421,9 +422,11 @@ video_queue_lock = threading.Condition()
 video_thread_running = True
 currently_playing_job = None  # Job đang phát (KHÔNG tính vào pending)
 
-# ============ RECENT RESULTS QUEUE (3 mới nhất) ============
-recent_results = deque(maxlen=3)  # Lưu 3 transcript mới nhất để hiển thị
+# ============ RECENT RESULTS QUEUE (3 response gần nhất) ============
+recent_results = deque(maxlen=3)  # Lưu 3 response (câu) gần nhất từ BE
 recent_results_lock = threading.Lock()
+last_displayed_frame = None  # Giữ khung hình cuối cùng khi hết response
+last_displayed_frame_lock = threading.Lock()
 
 def enqueue_video_job(job: VideoJob):
     """Thêm job vào pending queue. Tự động drop oldest nếu đầy (maxlen=3)."""
@@ -489,6 +492,11 @@ def play_single_video(video_path: str, overlay_word: str = "", max_duration: flo
                 break
                 
     finally:
+        # Lưu khung hình cuối cùng trước khi release
+        if frame is not None:
+            with last_displayed_frame_lock:
+                global last_displayed_frame
+                last_displayed_frame = frame.copy()
         cap.release()
 
 def video_playback_worker():
@@ -513,11 +521,7 @@ def video_playback_worker():
         if job is None:
             continue
         
-        # ✅ Xóa khỏi recent_results vì đã bắt đầu phát video
-        with recent_results_lock:
-            short_text = job.transcript[:25] if job.transcript else job.vsl_text[:25]
-            if short_text and short_text in recent_results:
-                recent_results.remove(short_text)
+        # ✅ Giữ nguyên recent_results - không xóa khi phát, để hiển thị 3 response gần nhất
         
         try:
             # Set state PLAYING
@@ -559,7 +563,11 @@ def video_playback_worker():
             # ✅ Về RECORDING nếu vẫn đang recording mode
             if not stop_video and is_recording:
                 current_state = State.RECORDING
-                # Giữ nguyên màn hình - không hiển thị gì thêm
+                # ✅ Giữ nguyên khung hình cuối cùng khi hết response
+                with last_displayed_frame_lock:
+                    if last_displayed_frame is not None:
+                        response_text = job.vsl_text or job.transcript or ""
+                        show_frame(last_displayed_frame, overlay_text=response_text)
         
         except Exception as e:
             print(f"❌ Video worker error: {e}")
@@ -587,8 +595,8 @@ class VADAudioStreamer:
     MAX_SPEECH_SECONDS = 8.0  # Giảm để tránh Whisper hallucinate
 
     def __init__(self):
-        # Mode 2 = balanced (giảm false positive, vẫn nhạy)
-        self.vad = webrtcvad.Vad(2) if VAD_AVAILABLE else None
+        # Mode 1 = moderate (nhạy hơn, chỉ bỏ noise vừa phải)
+        self.vad = webrtcvad.Vad(1) if VAD_AVAILABLE else None
 
         self.preroll_buffer = deque(maxlen=PREROLL_FRAMES)
         self.speech_buffer = bytearray()
@@ -620,8 +628,8 @@ class VADAudioStreamer:
         if self.frames_processed % 200 == 0:
             print(f"🎤 RMS={rms:.0f} | in_speech={self.in_speech}")
 
-        # Skip silence hoàn toàn (RMS < 5 = hoàn toàn im lặng)
-        if rms < 5:
+        # Skip silence hoàn toàn (RMS < 3 = hoàn toàn im lặng)
+        if rms < 3:
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
             return b''
@@ -630,16 +638,16 @@ class VADAudioStreamer:
         if rms > MAX_RMS_THRESHOLD:
             return b''
 
-        # Fixed threshold thấp - để Silero VAD backend lọc
-        threshold = 80  # Threshold cố định thấp
+        # Threshold vừa phải - chỉ lọc noise nhẹ
+        threshold = 60  # Threshold thấp hơn → nhạy hơn
 
-        # VAD decision
+        # VAD decision (moderate)
         is_speech = False
         if self.vad:
             try:
                 is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
-                # Chỉ reject nếu RMS quá thấp (< 50)
-                if is_speech and rms < 50:
+                # Chỉ reject nếu RMS cực thấp (< 30) - vừa phải
+                if is_speech and rms < 30:
                     is_speech = False
             except:
                 is_speech = rms > threshold
@@ -798,10 +806,10 @@ async def receive_results(ws):
                         
                         # ✅ Thêm vào recent_results để hiển thị trên LCD
                         with recent_results_lock:
-                            # Lưu transcript ngắn gọn (max 25 ký tự)
-                            short_text = transcript[:25] if transcript else vsl_text[:25]
-                            if short_text:
-                                recent_results.append(short_text)
+                            # Lưu câu response đầy đủ (cả câu, không phải token)
+                            full_sentence = vsl_text if vsl_text else transcript
+                            if full_sentence:
+                                recent_results.append(full_sentence)
                                 print(f"📺 Recent results: {list(recent_results)}")
                     else:
                         print(f"⚠️ Empty words: {transcript}")

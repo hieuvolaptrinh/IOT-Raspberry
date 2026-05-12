@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-BLE WiFi Setup Server - Sử dụng BlueZ D-Bus API (có sẵn trên Raspberry Pi OS)
 
-Chức năng:
-  1. Phát sóng BLE với tên "Pi-Setup"
-  2. Nhận cấu hình WiFi + API_URL qua JSON (Characteristic UUID abcd - Write)
-  3. Trả về IP hiện tại của mạch qua BLE (Characteristic UUID abce - Read)
-
-Không cần pip install — tất cả thư viện đều có sẵn trên Raspberry Pi OS.
-"""
 
 import dbus
 import dbus.exceptions
@@ -461,13 +452,13 @@ if __name__ == '__main__':
         error_handler=register_app_error_cb
     )
 
-    print("🔴 BLE Server đang chạy (Luôn phát sóng)...")
+    print("BLE Server đang chạy (Luôn phát sóng)...")
     print("   Nhấn Ctrl+C để tắt.\n")
 
     mainloop = GLib.MainLoop()
     try:
         mainloop.run()
     except KeyboardInterrupt:
-        print("\n🛑 Đang tắt BLE Server...")
+        print("\nĐang tắt BLE Server...")
         ad_manager.UnregisterAdvertisement(adv.get_path())
         print("👋 Đã tắt.")
