@@ -3,8 +3,12 @@
 """
 BLE WiFi Setup Server - Sử dụng BlueZ D-Bus API (có sẵn trên Raspberry Pi OS)
 
-Phát sóng BLE với tên "Pi-Setup", nhận cấu hình WiFi qua JSON.
-Không cần pip install thêm thư viện nào - tất cả đều có sẵn trên hệ thống.
+Chức năng:
+  1. Phát sóng BLE với tên "Pi-Setup"
+  2. Nhận cấu hình WiFi + API_URL qua JSON (Characteristic UUID abcd - Write)
+  3. Trả về IP hiện tại của mạch qua BLE (Characteristic UUID abce - Read)
+
+Không cần pip install — tất cả thư viện đều có sẵn trên Raspberry Pi OS.
 """
 
 import dbus
@@ -14,7 +18,6 @@ import dbus.service
 import json
 import os
 import subprocess
-import array
 import sys
 
 from gi.repository import GLib
@@ -31,9 +34,42 @@ LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
 
 # ============ UUIDs ============
 WIFI_SERVICE_UUID = '00001234-0000-1000-8000-00805f9b34fb'
-WIFI_CHRC_UUID = '0000abcd-0000-1000-8000-00805f9b34fb'
+WIFI_CHRC_UUID = '0000abcd-0000-1000-8000-00805f9b34fb'   # Write: WiFi + ENV config
+IP_CHRC_UUID = '0000abce-0000-1000-8000-00805f9b34fb'     # Read:  IP info
 
-# ============ WIFI CONNECTION ============
+# ============ ĐƯỜNG DẪN .ENV ============
+# Thay đổi nếu project của bạn nằm ở đường dẫn khác
+ENV_FILE_PATH = '/home/pi/IOT-Raspberry/.env'
+
+# ============ HELPER FUNCTIONS ============
+def get_device_ips():
+    """Lấy tất cả IP hiện tại của mạch (WiFi, Tailscale, Ethernet...)."""
+    ips = {}
+    try:
+        result = subprocess.run(
+            ['hostname', '-I'], capture_output=True, text=True, timeout=5
+        )
+        all_ips = result.stdout.strip().split()
+        for ip in all_ips:
+            if ip.startswith('100.'):
+                ips['tailscale'] = ip
+            elif ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.'):
+                ips['wifi'] = ip
+    except Exception:
+        pass
+
+    # Lấy hostname
+    try:
+        result = subprocess.run(
+            ['hostname'], capture_output=True, text=True, timeout=5
+        )
+        ips['hostname'] = result.stdout.strip()
+    except Exception:
+        pass
+
+    return ips
+
+
 def connect_wifi(ssid, password):
     """Kết nối WiFi bằng nmcli."""
     print(f"📶 Đang kết nối WiFi: {ssid}...")
@@ -52,6 +88,45 @@ def connect_wifi(ssid, password):
         print(f"❌ Lỗi kết nối WiFi: {e}")
 
 
+def update_env_file(api_url):
+    """Cập nhật API_URL trong file .env"""
+    print(f"📝 Đang cập nhật .env: API_URL={api_url}")
+    try:
+        # Đọc file .env hiện tại
+        env_lines = []
+        found = False
+        if os.path.exists(ENV_FILE_PATH):
+            with open(ENV_FILE_PATH, 'r') as f:
+                for line in f:
+                    if line.strip().startswith('API_URL='):
+                        env_lines.append(f'API_URL={api_url}\n')
+                        found = True
+                    else:
+                        env_lines.append(line)
+
+        if not found:
+            env_lines.append(f'API_URL={api_url}\n')
+
+        # Ghi lại file
+        with open(ENV_FILE_PATH, 'w') as f:
+            f.writelines(env_lines)
+
+        print(f"✅ Đã cập nhật .env thành công!")
+
+        # Restart service chính (real_time.py) để nhận config mới
+        try:
+            subprocess.run(
+                ['sudo', 'systemctl', 'restart', 'signify'],
+                capture_output=True, timeout=10
+            )
+            print("🔄 Đã restart service chính (signify)")
+        except Exception:
+            print("⚠️ Không tìm thấy service 'signify' để restart (bỏ qua)")
+
+    except Exception as e:
+        print(f"❌ Lỗi cập nhật .env: {e}")
+
+
 # ============ BLUEZ HELPERS ============
 def find_adapter(bus):
     """Tìm adapter Bluetooth (hci0) trên hệ thống."""
@@ -60,7 +135,6 @@ def find_adapter(bus):
         DBUS_OM_IFACE
     )
     objects = remote_om.GetManagedObjects()
-
     for path, interfaces in objects.items():
         if GATT_MANAGER_IFACE in interfaces:
             return path
@@ -83,7 +157,7 @@ class Advertisement(dbus.service.Object):
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_properties(self):
-        properties = {
+        return {
             LE_ADVERTISEMENT_IFACE: {
                 'Type': self.ad_type,
                 'LocalName': dbus.String(self.local_name),
@@ -91,7 +165,6 @@ class Advertisement(dbus.service.Object):
                 'IncludeTxPower': dbus.Boolean(self.include_tx_power),
             }
         }
-        return properties
 
     def get_path(self):
         return dbus.ObjectPath(self.path)
@@ -112,7 +185,7 @@ class Advertisement(dbus.service.Object):
 
 # ============ GATT SERVICE ============
 class WifiService(dbus.service.Object):
-    """GATT Service chứa Characteristic để nhận cấu hình WiFi."""
+    """GATT Service chứa các Characteristic."""
 
     PATH_BASE = '/org/bluez/example/service'
 
@@ -149,11 +222,14 @@ class WifiService(dbus.service.Object):
         return self.get_properties()[GATT_SERVICE_IFACE]
 
 
-# ============ GATT CHARACTERISTIC (nhận WiFi config) ============
+# ============ CHARACTERISTIC 1: WiFi + ENV Config (UUID abcd - Write) ============
 class WifiCharacteristic(dbus.service.Object):
     """
-    Characteristic UUID abcd — nhận dữ liệu JSON WiFi từ điện thoại/máy tính.
-    Hỗ trợ: write (ghi dữ liệu) + read (đọc trạng thái hiện tại).
+    UUID abcd — Nhận cấu hình WiFi + API_URL từ điện thoại/máy tính.
+
+    Dữ liệu gửi vào (JSON):
+      {"ssid":"TenWifi", "password":"MatKhau"}
+      {"ssid":"TenWifi", "password":"MatKhau", "api_url":"http://x.x.x.x:8000"}
     """
 
     def __init__(self, bus, index, service):
@@ -161,9 +237,79 @@ class WifiCharacteristic(dbus.service.Object):
         self.bus = bus
         self.uuid = WIFI_CHRC_UUID
         self.service = service
-        self.flags = ['write', 'read']
+        self.flags = ['write']
         self.value = []
-        self.status_message = "Sẵn sàng nhận WiFi config"
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_properties(self):
+        return {
+            GATT_CHRC_IFACE: {
+                'Service': self.service.get_path(),
+                'UUID': self.uuid,
+                'Flags': self.flags,
+                'Value': dbus.Array(self.value, signature='y'),
+            }
+        }
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        if interface != GATT_CHRC_IFACE:
+            raise dbus.exceptions.DBusException(
+                'org.freedesktop.DBus.Error.InvalidArgs',
+                'Invalid interface: ' + interface
+            )
+        return self.get_properties()[GATT_CHRC_IFACE]
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}', out_signature='')
+    def WriteValue(self, value, options):
+        """Nhận dữ liệu WiFi + API_URL từ client."""
+        try:
+            raw_bytes = bytes([int(b) for b in value])
+            decoded = raw_bytes.decode('utf-8')
+            print(f"📥 Nhận được dữ liệu: {decoded}")
+
+            wifi_info = json.loads(decoded)
+            ssid = wifi_info.get("ssid", "").strip()
+            password = wifi_info.get("password", "").strip()
+            api_url = wifi_info.get("api_url", "").strip()
+
+            # Kết nối WiFi nếu có SSID + Password
+            if ssid and password:
+                print(f"🔑 SSID: {ssid} | Password: {'*' * len(password)}")
+                GLib.timeout_add(100, lambda: connect_wifi(ssid, password) or False)
+
+            # Cập nhật .env nếu có api_url
+            if api_url:
+                GLib.timeout_add(2000, lambda: update_env_file(api_url) or False)
+
+            if not ssid and not api_url:
+                print("⚠️ JSON không chứa ssid hoặc api_url, bỏ qua.")
+
+        except json.JSONDecodeError as e:
+            print(f"❌ Lỗi parse JSON: {e}")
+        except Exception as e:
+            print(f"❌ Lỗi xử lý dữ liệu: {e}")
+
+
+# ============ CHARACTERISTIC 2: IP Info (UUID abce - Read) ============
+class IPInfoCharacteristic(dbus.service.Object):
+    """
+    UUID abce — Đọc thông tin IP hiện tại của mạch.
+
+    Khi client đọc (Read), trả về JSON chứa:
+      {"wifi":"192.168.1.50","tailscale":"100.x.x.x","hostname":"hieuvo"}
+    """
+
+    def __init__(self, bus, index, service):
+        self.path = service.path + '/char' + str(index)
+        self.bus = bus
+        self.uuid = IP_CHRC_UUID
+        self.service = service
+        self.flags = ['read']
+        self.value = []
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_properties(self):
@@ -190,46 +336,17 @@ class WifiCharacteristic(dbus.service.Object):
 
     @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
     def ReadValue(self, options):
-        """Trả về trạng thái hiện tại khi client đọc."""
-        msg = self.status_message.encode('utf-8')
-        return dbus.Array([dbus.Byte(b) for b in msg], signature='y')
-
-    @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}', out_signature='')
-    def WriteValue(self, value, options):
-        """Nhận dữ liệu WiFi JSON từ client và thực hiện kết nối."""
-        try:
-            # Chuyển đổi dbus.Array[Byte] → string
-            raw_bytes = bytes([int(b) for b in value])
-            decoded = raw_bytes.decode('utf-8')
-            print(f"📥 Nhận được dữ liệu: {decoded}")
-
-            # Parse JSON
-            wifi_info = json.loads(decoded)
-            ssid = wifi_info.get("ssid", "").strip()
-            password = wifi_info.get("password", "").strip()
-
-            if ssid and password:
-                self.status_message = f"Đang kết nối: {ssid}"
-                print(f"🔑 SSID: {ssid} | Password: {'*' * len(password)}")
-                # Thực hiện kết nối WiFi (chạy trong thread riêng để không block BLE)
-                GLib.timeout_add(100, lambda: connect_wifi(ssid, password) or False)
-            else:
-                self.status_message = "Lỗi: Thiếu SSID hoặc Password"
-                print("❌ Thiếu SSID hoặc Password trong JSON!")
-
-        except json.JSONDecodeError as e:
-            self.status_message = "Lỗi: JSON không hợp lệ"
-            print(f"❌ Lỗi parse JSON: {e}")
-        except Exception as e:
-            self.status_message = f"Lỗi: {str(e)[:30]}"
-            print(f"❌ Lỗi xử lý dữ liệu: {e}")
+        """Trả về JSON chứa IP hiện tại của mạch."""
+        ips = get_device_ips()
+        ip_json = json.dumps(ips, ensure_ascii=False)
+        print(f"📤 Client đọc IP: {ip_json}")
+        return dbus.Array([dbus.Byte(b) for b in ip_json.encode('utf-8')], signature='y')
 
 
 # ============ APPLICATION ============
 class WifiSetupApplication(dbus.service.Object):
     """
     GATT Application — đăng ký tất cả Service và Characteristic với BlueZ.
-    BlueZ yêu cầu một Application object quản lý tập trung tất cả GATT objects.
     """
 
     def __init__(self, bus):
@@ -237,10 +354,17 @@ class WifiSetupApplication(dbus.service.Object):
         self.services = []
         dbus.service.Object.__init__(self, bus, self.path)
 
-        # Tạo WiFi Service + Characteristic
+        # Tạo WiFi Service
         wifi_service = WifiService(bus, 0)
+
+        # Characteristic 1: WiFi + ENV config (Write) — UUID abcd
         wifi_chrc = WifiCharacteristic(bus, 0, wifi_service)
         wifi_service.characteristics.append(wifi_chrc)
+
+        # Characteristic 2: IP Info (Read) — UUID abce
+        ip_chrc = IPInfoCharacteristic(bus, 1, wifi_service)
+        wifi_service.characteristics.append(ip_chrc)
+
         self.services.append(wifi_service)
 
     def get_path(self):
@@ -268,6 +392,9 @@ def register_ad_error_cb(error):
 
 def register_app_cb():
     print("✅ GATT Application đã đăng ký thành công!")
+    ips = get_device_ips()
+    if ips:
+        print(f"🌐 IP hiện tại: {json.dumps(ips)}")
 
 def register_app_error_cb(error):
     print(f"❌ Lỗi đăng ký GATT Application: {error}")
@@ -277,15 +404,16 @@ def register_app_error_cb(error):
 # ============ MAIN ============
 if __name__ == '__main__':
     print("=" * 50)
-    print("📡 BLE WiFi Setup Server")
-    print("   Sử dụng BlueZ D-Bus API (có sẵn trên RPi OS)")
+    print("📡 BLE WiFi Setup Server v2.0")
+    print("   BlueZ D-Bus API (có sẵn trên RPi OS)")
+    print("   Characteristics:")
+    print("     UUID abcd → Write WiFi + API_URL config")
+    print("     UUID abce → Read IP hiện tại")
     print("=" * 50)
 
-    # Khởi tạo D-Bus mainloop
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
 
-    # Tìm Bluetooth adapter
     adapter_path = find_adapter(bus)
     if not adapter_path:
         print("❌ Không tìm thấy Bluetooth adapter!")
@@ -294,7 +422,7 @@ if __name__ == '__main__':
 
     print(f"🔵 Bluetooth adapter: {adapter_path}")
 
-    # Bật Bluetooth adapter nếu đang tắt
+    # Bật Bluetooth adapter
     adapter_props = dbus.Interface(
         bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
         DBUS_PROP_IFACE
@@ -305,13 +433,13 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"⚠️ Không thể bật adapter (có thể đã bật): {e}")
 
-    # Tạo GATT Application (Service + Characteristic)
+    # Tạo GATT Application
     app = WifiSetupApplication(bus)
 
     # Tạo BLE Advertisement
     adv = Advertisement(bus, 0)
 
-    # Đăng ký Advertisement với BlueZ
+    # Đăng ký Advertisement
     ad_manager = dbus.Interface(
         bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
         LE_ADVERTISING_MANAGER_IFACE
@@ -322,7 +450,7 @@ if __name__ == '__main__':
         error_handler=register_ad_error_cb
     )
 
-    # Đăng ký GATT Application với BlueZ
+    # Đăng ký GATT Application
     gatt_manager = dbus.Interface(
         bus.get_object(BLUEZ_SERVICE_NAME, adapter_path),
         GATT_MANAGER_IFACE
@@ -336,7 +464,6 @@ if __name__ == '__main__':
     print("🔴 BLE Server đang chạy (Luôn phát sóng)...")
     print("   Nhấn Ctrl+C để tắt.\n")
 
-    # Chạy mainloop
     mainloop = GLib.MainLoop()
     try:
         mainloop.run()
