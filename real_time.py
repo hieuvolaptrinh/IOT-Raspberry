@@ -8,7 +8,7 @@ import RPi.GPIO as GPIO
 import time
 import os
 import subprocess
-import asyncio
+import asyncioy
 import websockets
 import json
 import threading
@@ -45,27 +45,27 @@ else:
 WS_ENDPOINT = "/api/realtime/ws/vsl"
 
 VIDEO_SPEED = 2.0
-FINGERSPELL_SPEED = 2.5
+FINGERSPELL_SPEED = 3.5
 
 # ============ CONNECTION SETTINGS ============
 RECONNECT_DELAY = 3
 MAX_RECONNECT_ATTEMPTS = 5
 
-# ============ VAD SETTINGS (MODERATE - chỉ bỏ noise vừa) ============
+# ============ VAD SETTINGS (ULTRA SENSITIVE - mic cùi, âm lượng rất nhỏ) ============
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
 FRAME_DURATION_MS = 30
 FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 480 samples
 
-PREROLL_FRAMES = 12                    # 360ms - giữ nhiều context đầu
-HANGOVER_FRAMES = 20                   # 600ms - ít cắt giữa câu
-MIN_SPEECH_FRAMES = 2                  # 60ms - giữ nhiều đoạn ngắn hơn
+PREROLL_FRAMES = 25                    # 750ms - giữ thật nhiều context đầu
+HANGOVER_FRAMES = 50                   # 1500ms - giữ rất lâu tránh cắt giữa câu
+MIN_SPEECH_FRAMES = 1                  # 30ms - giữ cả đoạn cực ngắn
 
 # NOTE: SEND_INTERVAL_* removed - no longer needed, always send immediately
 
-MIN_RMS_THRESHOLD = 80                 # nhạy hơn - chỉ lọc noise vừa
-MAX_RMS_THRESHOLD = 32000
+MIN_RMS_THRESHOLD = 0                  # KHÔNG gate RMS - chấp nhận mọi âm thanh
+MAX_RMS_THRESHOLD = 32767              # max int16 - không bỏ clipping
 
 # NOTE: Cooldown removed - audio stream always runs regardless of video playback
 NOISE_CALIBRATION_FRAMES = 50          # ~1.5s calibration
@@ -129,9 +129,9 @@ AUDIO_DEVICE = get_usb_audio_device()
 def boost_mic_capture_volume():
     # fail-open: không phụ thuộc card cụ thể
     for cmd in [
-        ["amixer", "set", "Capture", "80%"],
-        ["amixer", "set", "Mic", "80%"],
-        ["amixer", "set", "PCM", "80%"],
+        ["amixer", "set", "Capture", "100%"],
+        ["amixer", "set", "Mic", "100%"],
+        ["amixer", "set", "PCM", "100%"],
         ["amixer", "set", "Auto Gain Control", "off"],
     ]:
         try:
@@ -551,12 +551,12 @@ video_thread.start()
 # ============ VAD-BASED AUDIO STREAMING (OPTIMIZED) ============
 class VADAudioStreamer:
     """
-    Optimized VAD Streamer cho Raspberry Pi Zero 2.
-    - webrtcvad mode 2 (balanced)
-    - Adaptive noise floor calibration
-    - Cooldown sau video playback
+    Ultra-sensitive VAD Streamer cho mic yếu/cùi.
+    - webrtcvad mode 0 (least aggressive)
+    - Gần như không lọc - gửi mọi âm thanh có tín hiệu
+    - Chỉ bỏ dead silence (RMS ≈ 0)
     """
-    MAX_SPEECH_SECONDS = 8.0  # Giảm để tránh Whisper hallucinate
+    MAX_SPEECH_SECONDS = 5.0   # 5s là đủ
 
     def __init__(self):
         # Mode 0 = least aggressive (giữ nhiều tiếng nói hơn)
@@ -583,45 +583,29 @@ class VADAudioStreamer:
     def process_frame(self, frame_bytes: bytes) -> bytes:
         self.frames_processed += 1
 
-        # ❌ REMOVED COOLDOWN: Audio stream phải luôn chạy, kể cả khi phát video
-        # Backend sẽ lo AEC/echo cancellation nếu cần
-
         rms = self._calculate_rms(frame_bytes)
 
         # Debug log mỗi 200 frames (~6s)
         if self.frames_processed % 200 == 0:
             print(f"🎤 RMS={rms:.0f} | in_speech={self.in_speech}")
 
-        # Skip silence hoàn toàn (RMS < 1 = gần như im lặng)
-        if rms < 1:
+        # CHỈ bỏ khi hoàn toàn im lặng tuyệt đối (digital zero)
+        if rms < 0.1:
             if not self.in_speech:
                 self.preroll_buffer.append(frame_bytes)
             return b''
 
-        # Skip clipping
-        if rms > MAX_RMS_THRESHOLD:
-            return b''
+        # KHÔNG skip clipping - mic yếu không bao giờ clip
 
-        # Threshold nhạy hơn - giữ nhiều tiếng nói hơn
-        threshold = 10
-
-        # VAD decision (moderate)
-        is_speech = False
-        if self.vad:
-            try:
-                is_speech = self.vad.is_speech(frame_bytes, SAMPLE_RATE)
-                # Không reject thêm để tránh mất tiếng với mic yếu
-            except:
-                is_speech = rms > threshold
-        else:
-            # Không có VAD: dựa vào RMS
-            is_speech = rms > threshold
+        # ===== ULTRA SENSITIVE: coi MỌI tín hiệu > 0 là speech =====
+        # VAD chỉ dùng làm tham khảo, nhưng RMS > 0 luôn = speech
+        is_speech = True  # Mọi âm thanh không phải dead silence đều là speech
 
         if is_speech:
             if not self.in_speech:
                 self.in_speech = True
                 self.speech_frame_count = 0
-                print(f"🎙️ Speech START (rms={rms:.0f}, threshold={threshold:.0f})")
+                print(f"🎙️ Speech START (rms={rms:.0f})")
                 for pf in self.preroll_buffer:
                     self.speech_buffer.extend(pf)
                 self.preroll_buffer.clear()
