@@ -32,10 +32,10 @@ sudo systemctl start bluetooth
 
 Mã nguồn `ble_server.py` sử dụng BlueZ D-Bus API (cách chính thức của Linux). BLE Server cung cấp 2 tính năng:
 
-| Tính năng | UUID | Loại | Mô tả |
-|---|---|---|---|
+| Tính năng           | UUID   | Loại  | Mô tả                                       |
+| ------------------- | ------ | ----- | ------------------------------------------- |
 | Cấu hình WiFi + API | `abcd` | Write | Gửi JSON để kết nối WiFi và cập nhật `.env` |
-| Xem IP mạch | `abce` | Read | Đọc IP WiFi, Tailscale, hostname |
+| Xem IP mạch         | `abce` | Read  | Đọc IP WiFi, Tailscale, hostname            |
 
 Quy trình hoạt động:
 
@@ -120,13 +120,17 @@ Bất cứ lúc nào muốn kết nối mạch vào WiFi mới, bạn có thể 
 7. Nhập cấu hình WiFi dưới dạng JSON:
 
    ```json
-   {"ssid":"Ten_WiFi","password":"Mat_Khau"}
+   { "ssid": "Ten_WiFi", "password": "Mat_Khau" }
    ```
 
    Hoặc gửi kèm API_URL:
 
    ```json
-   {"ssid":"Ten_WiFi","password":"Mat_Khau","api_url":"http://192.168.1.100:8000"}
+   {
+     "ssid": "Ten_WiFi",
+     "password": "Mat_Khau",
+     "api_url": "http://192.168.1.100:8000"
+   }
    ```
 
 8. Nhấn **Send/Write**.
@@ -137,8 +141,12 @@ Bất cứ lúc nào muốn kết nối mạch vào WiFi mới, bạn có thể 
 10. Mạch sẽ trả về JSON chứa IP hiện tại:
 
     ```json
-    {"wifi":"192.168.1.50","tailscale":"100.64.0.3","hostname":"hieuvo"}
+    { "wifi": "192.168.1.50", "tailscale": "100.64.0.3", "hostname": "hieuvo" }
     ```
+
+    > 💡 **Tip kết nối từ xa (Mọi IP bên ngoài):** 
+    > Sử dụng IP của `tailscale` (VD: `100.64.0.3`) để kết nối SSH tới mạch từ BẤT KỲ ĐÂU trên thế giới (kể cả dùng 4G), miễn là máy tính của bạn cũng đang cài đặt và bật Tailscale!
+    > Lệnh kết nối: `ssh TÊN_USER_CỦA_BẠN@100.64.0.3`
 
 ### Cách 2: Sử dụng Python trên Máy Tính (Windows / Mac / Linux)
 

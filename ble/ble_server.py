@@ -11,26 +11,11 @@ import os
 import subprocess
 import sys
 
+# Add parent directory to sys.path to import constraint.py
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from constraint import *
+
 from gi.repository import GLib
-
-# ============ BLUEZ D-BUS INTERFACES ============
-BLUEZ_SERVICE_NAME = 'org.bluez'
-GATT_MANAGER_IFACE = 'org.bluez.GattManager1'
-LE_ADVERTISING_MANAGER_IFACE = 'org.bluez.LEAdvertisingManager1'
-DBUS_OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
-DBUS_PROP_IFACE = 'org.freedesktop.DBus.Properties'
-GATT_SERVICE_IFACE = 'org.bluez.GattService1'
-GATT_CHRC_IFACE = 'org.bluez.GattCharacteristic1'
-LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
-
-# ============ UUIDs ============
-WIFI_SERVICE_UUID = '00001234-0000-1000-8000-00805f9b34fb'
-WIFI_CHRC_UUID = '0000abcd-0000-1000-8000-00805f9b34fb'   # Write: WiFi + ENV config
-IP_CHRC_UUID = '0000abce-0000-1000-8000-00805f9b34fb'     # Read:  IP info
-
-# ============ ĐƯỜNG DẪN .ENV ============
-# Thay đổi nếu project của bạn nằm ở đường dẫn khác
-ENV_FILE_PATH = '/home/pi/IOT-Raspberry/.env'
 
 # ============ HELPER FUNCTIONS ============
 def get_device_ips():
