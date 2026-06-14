@@ -665,7 +665,6 @@ if __name__ == '__main__':
         mainloop.run()
     except KeyboardInterrupt:
         print("\n👋 Đang tắt...")
-        global video_thread_running
         video_thread_running = False
         ad_manager.UnregisterAdvertisement(adv.get_path())
         spi.close()
