@@ -331,7 +331,6 @@ def video_playback_worker():
         try:
             stop_video = False
             print(f"🎬 Đang phát: {job.words}")
-            show_message(["Đang xử lý..."], (100, 200, 255))
             
             for word in job.words:
                 if stop_video: break
@@ -345,8 +344,7 @@ def video_playback_worker():
                             if stop_video: break
                             play_single_video(str(letter_video), overlay_word=job.transcript, speed_multiplier=FINGERSPELL_SPEED)
             
-            if not stop_video:
-                show_message(["Sẵn sàng", "", "Chờ nhận dữ liệu"], (100, 255, 100))
+            # Giữ nguyên frame cuối cùng, không hiển thị thông báo chờ
         except Exception as e:
             print(f"❌ Lỗi phát video: {e}")
         finally:
@@ -615,11 +613,11 @@ class VslCharacteristic(dbus.service.Object):
                 print(f"🛠️ Nhận lệnh điều khiển: {action}")
                 
                 if action == 'shutdown':
-                    show_message(["Đang tắt máy..."], (255, 100, 100))
+                    show_message(["đang tắt máy..."], (255, 100, 100))
                     time.sleep(2)
                     subprocess.run(['sudo', 'shutdown', '-h', 'now'])
                 elif action == 'reboot':
-                    show_message(["Đang khởi động lại..."], (255, 200, 100))
+                    show_message(["đang khởi động lại..."], (255, 200, 100))
                     time.sleep(2)
                     subprocess.run(['sudo', 'reboot'])
                 elif action == 'set_mode':
@@ -709,7 +707,7 @@ if __name__ == '__main__':
 
     # Bật LCD
     init_lcd()
-    show_message(["Đang khởi động", "BLE Server..."], (100, 200, 255))
+    show_message(["vui lòng", "kết nối ble"], (100, 200, 255))
 
     # Chạy thread phát video
     video_thread = threading.Thread(target=video_playback_worker, daemon=True)
@@ -722,7 +720,7 @@ if __name__ == '__main__':
     adapter_path = find_adapter(bus)
     if not adapter_path:
         print("❌ Không tìm thấy Bluetooth adapter!")
-        show_message(["Lỗi Bluetooth", "Không tìm thấy adapter"], (255, 100, 100))
+        show_message(["lỗi bluetooth", "không tìm thấy adapter"], (255, 100, 100))
         sys.exit(1)
 
     print(f"🔵 Bluetooth adapter: {adapter_path}")
@@ -758,7 +756,7 @@ if __name__ == '__main__':
     gatt_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), GATT_MANAGER_IFACE)
     gatt_manager.RegisterApplication(app.get_path(), {}, reply_handler=lambda: print("✅ GATT App OK"), error_handler=lambda e: print(f"❌ App Error: {e}"))
 
-    show_message(["Sẵn sàng", "", "Chờ nhận dữ liệu"], (100, 255, 100))
+    show_message(["sẵn sàng"], (100, 255, 100))
     print("BLE Application đang chạy...")
 
     mainloop = GLib.MainLoop()
