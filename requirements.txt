@@ -1,0 +1,11 @@
+# === Cài qua pip ===
+opencv-python-headless
+numpy
+Pillow
+spidev
+RPi.GPIO
+dbus-python
+
+# === Cài qua apt (không cần pip) ===
+# sudo apt-get install -y python3-gi python3-dbus bluetooth bluez
+# PyGObject (gi) khuyên dùng qua apt vì build từ pip rất khó trên Pi

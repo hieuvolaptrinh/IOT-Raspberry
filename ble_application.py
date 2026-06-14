@@ -5,6 +5,7 @@ import dbus
 import dbus.exceptions
 import dbus.mainloop.glib
 import dbus.service
+import gc
 import json
 import os
 import subprocess
@@ -100,25 +101,39 @@ def init_lcd():
 
 _display_buffer = np.empty((240, 240, 2), dtype=np.uint8)
 _rgb565_buffer = np.empty((240, 240), dtype=np.uint16)
+_resize_buffer = np.empty((240, 240, 3), dtype=np.uint8)
+_overlay_cache = {}  # Cache overlay text → np.ndarray, tránh tạo lại mỗi frame
+_OVERLAY_CACHE_MAX = 20  # Giới hạn số overlay cache
 
 def _create_text_overlay(text: str) -> np.ndarray:
+    # Cache overlay để tránh tạo PIL Image mỗi frame
+    if text in _overlay_cache:
+        return _overlay_cache[text]
+
     pil_img = Image.new('RGB', (240, 40), (0, 0, 0))
     draw = ImageDraw.Draw(pil_img)
-    text = text[:30]
+    text_short = text[:30]
     try:
-        bbox = draw.textbbox((0, 0), text, font=FONT_VN)
+        bbox = draw.textbbox((0, 0), text_short, font=FONT_VN)
         text_width = bbox[2] - bbox[0]
     except:
-        text_width = len(text) * 10
+        text_width = len(text_short) * 10
     
     x = max(5, (240 - text_width) // 2)
-    draw.text((x, 10), text, font=FONT_VN, fill=(255, 255, 255))
-    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    draw.text((x, 10), text_short, font=FONT_VN, fill=(255, 255, 255))
+    result = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    # Xóa cache cũ nếu quá nhiều
+    if len(_overlay_cache) >= _OVERLAY_CACHE_MAX:
+        _overlay_cache.clear()
+    _overlay_cache[text] = result
+    return result
 
 def show_frame(frame, overlay_text=None):
-    global _display_buffer, _rgb565_buffer
+    global _display_buffer, _rgb565_buffer, _resize_buffer
 
-    frame = cv2.resize(frame, (240, 240), interpolation=cv2.INTER_NEAREST)
+    cv2.resize(frame, (240, 240), dst=_resize_buffer, interpolation=cv2.INTER_NEAREST)
+    frame = _resize_buffer
 
     if overlay_text:
         overlay = _create_text_overlay(overlay_text)
@@ -334,6 +349,9 @@ def video_playback_worker():
                 show_message(["Sẵn sàng", "", "Chờ nhận dữ liệu"], (100, 255, 100))
         except Exception as e:
             print(f"❌ Lỗi phát video: {e}")
+        finally:
+            # Dọn bộ nhớ sau mỗi job, tránh phân mảnh RAM chạy lâu
+            gc.collect()
 
 # ============ BLE HELPER FUNCTIONS ============
 def get_device_ips():
@@ -511,6 +529,9 @@ class IPInfoCharacteristic(dbus.service.Object):
         return dbus.Array([dbus.Byte(b) for b in ip_json.encode('utf-8')], signature='y')
 
 class VslCharacteristic(dbus.service.Object):
+    _BUFFER_MAX_SIZE = 8192   # Giới hạn buffer tránh rò rỉ RAM
+    _BUFFER_TIMEOUT_S = 10    # Xóa buffer nếu không nhận hết chunk trong 10s
+
     def __init__(self, bus, index, service):
         self.path = service.path + '/char' + str(index)
         self.bus = bus
@@ -519,6 +540,7 @@ class VslCharacteristic(dbus.service.Object):
         self.flags = ['write']
         self.value = []
         self._buffer = ""
+        self._buffer_started_at = None
         dbus.service.Object.__init__(self, bus, self.path)
     def get_properties(self):
         return {
@@ -538,6 +560,13 @@ class VslCharacteristic(dbus.service.Object):
             raw_bytes = bytes([int(b) for b in value])
             decoded = raw_bytes.decode('utf-8')
             
+            # Xóa buffer cũ nếu quá timeout (client gửi dang dở rồi bỏ)
+            if self._buffer and self._buffer_started_at:
+                if time.time() - self._buffer_started_at > self._BUFFER_TIMEOUT_S:
+                    print("⚠️ VSL buffer timeout, xóa buffer cũ")
+                    self._buffer = ""
+                    self._buffer_started_at = None
+
             # Xử lý logic chunking [1/3]...
             if decoded.startswith('['):
                 end_idx = decoded.find(']')
@@ -546,10 +575,20 @@ class VslCharacteristic(dbus.service.Object):
                     if len(chunk_info) == 2:
                         idx = int(chunk_info[0])
                         total = int(chunk_info[1])
+                        if idx == 1:
+                            self._buffer = ""  # Reset khi bắt đầu chuỗi chunk mới
+                            self._buffer_started_at = time.time()
                         self._buffer += decoded[end_idx+1:]
+                        # Bảo vệ: xóa buffer nếu quá lớn
+                        if len(self._buffer) > self._BUFFER_MAX_SIZE:
+                            print("⚠️ VSL buffer quá lớn, xóa")
+                            self._buffer = ""
+                            self._buffer_started_at = None
+                            return
                         if idx == total:
                             self._process_message(self._buffer)
                             self._buffer = ""
+                            self._buffer_started_at = None
                         return
             
             # Gửi luôn trong 1 cục (nếu payload ngắn)
@@ -618,6 +657,50 @@ class WifiSetupApplication(dbus.service.Object):
                 response[chrc.get_path()] = chrc.get_properties()
         return response
 
+# ============ BLE AGENT (Auto-accept pairing) ============
+AGENT_IFACE = 'org.bluez.Agent1'
+AGENT_MANAGER_IFACE = 'org.bluez.AgentManager1'
+AGENT_PATH = '/org/bluez/example/agent'
+
+class NoInputNoOutputAgent(dbus.service.Object):
+    """Agent tự động chấp nhận pairing mà không cần nhập PIN hay xác nhận."""
+
+    @dbus.service.method(AGENT_IFACE, in_signature='', out_signature='')
+    def Release(self):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature='os', out_signature='')
+    def AuthorizeService(self, device, uuid):
+        print(f"✅ Auto-authorize service {uuid} cho {device}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='s')
+    def RequestPinCode(self, device):
+        return "0000"
+
+    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='u')
+    def RequestPasskey(self, device):
+        return dbus.UInt32(0)
+
+    @dbus.service.method(AGENT_IFACE, in_signature='ouq', out_signature='')
+    def DisplayPasskey(self, device, passkey, entered):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature='os', out_signature='')
+    def DisplayPinCode(self, device, pincode):
+        pass
+
+    @dbus.service.method(AGENT_IFACE, in_signature='ou', out_signature='')
+    def RequestConfirmation(self, device, passkey):
+        print(f"✅ Auto-confirm pairing cho {device}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='o', out_signature='')
+    def RequestAuthorization(self, device):
+        print(f"✅ Auto-authorize {device}")
+
+    @dbus.service.method(AGENT_IFACE, in_signature='', out_signature='')
+    def Cancel(self):
+        pass
+
 # ============ MAIN ============
 if __name__ == '__main__':
     print("=" * 50)
@@ -646,7 +729,25 @@ if __name__ == '__main__':
     adapter_props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), DBUS_PROP_IFACE)
     try:
         adapter_props.Set('org.bluez.Adapter1', 'Powered', dbus.Boolean(True))
-    except: pass
+        adapter_props.Set('org.bluez.Adapter1', 'Pairable', dbus.Boolean(True))
+        adapter_props.Set('org.bluez.Adapter1', 'Discoverable', dbus.Boolean(True))
+        adapter_props.Set('org.bluez.Adapter1', 'PairableTimeout', dbus.UInt32(0))
+        adapter_props.Set('org.bluez.Adapter1', 'DiscoverableTimeout', dbus.UInt32(0))
+    except Exception as e:
+        print(f"⚠️ Không thể set adapter properties: {e}")
+
+    # Đăng ký Agent tự động chấp nhận pairing (NoInputNoOutput)
+    agent = NoInputNoOutputAgent(bus, AGENT_PATH)
+    agent_manager = dbus.Interface(
+        bus.get_object(BLUEZ_SERVICE_NAME, '/org/bluez'),
+        AGENT_MANAGER_IFACE
+    )
+    try:
+        agent_manager.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
+        agent_manager.RequestDefaultAgent(AGENT_PATH)
+        print("✅ BLE Agent registered (NoInputNoOutput - auto accept pairing)")
+    except Exception as e:
+        print(f"⚠️ Agent registration: {e}")
 
     app = WifiSetupApplication(bus)
     adv = Advertisement(bus, 0)
