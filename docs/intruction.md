@@ -70,8 +70,8 @@ Quy trình hoạt động:
    Requires=bluetooth.target
 
    [Service]
-   ExecStartPre=/usr/bin/rfkill unblock bluetooth
-   ExecStartPre=/bin/sleep 1
+   ExecStartPre=-/usr/sbin/rfkill unblock bluetooth
+   ExecStartPre=/bin/sleep 2
    # Gọi thẳng python trong môi trường ảo thay vì python3 của hệ thống:
    ExecStart=/home/pi/lcd_env/bin/python /home/pi/IOT-Raspberry/ble_application.py
    WorkingDirectory=/home/pi/IOT-Raspberry

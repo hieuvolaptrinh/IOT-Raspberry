@@ -107,20 +107,53 @@ _OVERLAY_CACHE_MAX = 20  # Giới hạn số overlay cache
 
 def _create_text_overlay(text: str) -> np.ndarray:
     # Cache overlay để tránh tạo PIL Image mỗi frame
+    text = text.lower()  # Chữ thường
     if text in _overlay_cache:
         return _overlay_cache[text]
 
-    pil_img = Image.new('RGB', (240, 40), (0, 0, 0))
+    overlay_h = 60  # Cao hơn để chứa 2-3 dòng
+    pil_img = Image.new('RGB', (240, overlay_h), (0, 0, 0))
     draw = ImageDraw.Draw(pil_img)
-    text_short = text[:30]
-    try:
-        bbox = draw.textbbox((0, 0), text_short, font=FONT_VN)
-        text_width = bbox[2] - bbox[0]
-    except:
-        text_width = len(text_short) * 10
+    font = FONT_SMALL  # Font nhỏ hơn để không bị tràn
+
+    # Word-wrap: tách text thành nhiều dòng nếu quá dài
+    max_width = 230  # Trừ padding 2 bên
+    words = text.split()
+    lines = []
+    current_line = ""
+    for word in words:
+        test_line = f"{current_line} {word}".strip() if current_line else word
+        try:
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            w = bbox[2] - bbox[0]
+        except:
+            w = len(test_line) * 8
+        if w <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
     
-    x = max(5, (240 - text_width) // 2)
-    draw.text((x, 10), text_short, font=FONT_VN, fill=(255, 255, 255))
+    # Giới hạn tối đa 3 dòng
+    lines = lines[:3]
+
+    # Vẽ các dòng căn giữa
+    line_height = 18
+    total_h = len(lines) * line_height
+    start_y = (overlay_h - total_h) // 2
+    for i, line in enumerate(lines):
+        try:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            tw = bbox[2] - bbox[0]
+        except:
+            tw = len(line) * 8
+        x = max(5, (240 - tw) // 2)
+        y = start_y + i * line_height
+        draw.text((x, y), line, font=font, fill=(255, 255, 255))
+
     result = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     # Xóa cache cũ nếu quá nhiều
@@ -137,7 +170,7 @@ def show_frame(frame, overlay_text=None):
 
     if overlay_text:
         overlay = _create_text_overlay(overlay_text)
-        frame[200:240, :] = overlay 
+        frame[180:240, :] = overlay  # 60px cao hơn, bắt đầu từ dòng 180
 
     if MIRROR_MODE:
         frame = cv2.flip(frame, 1)
@@ -263,6 +296,9 @@ pending_video_queue = deque(maxlen=5)
 video_queue_lock = threading.Condition()
 video_thread_running = True
 stop_video = False
+_shell_cwd = '/home/pi/IOT-Raspberry'  # CWD hiện tại cho shell
+_shell_output_char = None  # Tham chiếu ShellOutputCharacteristic
+_ble_connected = False  # Trạng thái kết nối BLE
 
 def enqueue_video_job(job: VideoJob):
     with video_queue_lock:
@@ -621,11 +657,158 @@ class VslCharacteristic(dbus.service.Object):
                     time.sleep(2)
                     subprocess.run(['sudo', 'reboot'])
                 elif action == 'set_mode':
-                    # Placeholder for future mode switching
                     pass
+
+            elif msg_type == 'shell':
+                cmd = data.get('cmd', '').strip()
+                if cmd:
+                    threading.Thread(
+                        target=self._run_shell_command,
+                        args=(cmd,),
+                        daemon=True
+                    ).start()
+
+            elif msg_type == 'cd':
+                path = data.get('path', '').strip()
+                self._handle_cd(path)
                     
         except json.JSONDecodeError:
             print("❌ Lỗi parse JSON từ BLE")
+
+    def _handle_cd(self, path):
+        global _shell_cwd
+        if not path:
+            _shell_cwd = '/home/pi'
+        elif path.startswith('/'):
+            _shell_cwd = path
+        else:
+            _shell_cwd = os.path.normpath(os.path.join(_shell_cwd, path))
+        
+        # Kiểm tra thư mục tồn tại
+        if not os.path.isdir(_shell_cwd):
+            self._send_shell_output(f"cd: {_shell_cwd}: No such directory\n")
+            _shell_cwd = '/home/pi'
+        else:
+            self._send_shell_output(f"📂 {_shell_cwd}\n")
+
+    def _run_shell_command(self, cmd):
+        global _shell_cwd
+        print(f"🖥️ Shell: [{_shell_cwd}] $ {cmd}")
+        self._send_shell_output(f"$ {cmd}\n")
+        
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                shell=True,
+                cwd=_shell_cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={**os.environ, 'PATH': '/home/pi/lcd_env/bin:' + os.environ.get('PATH', '')}
+            )
+            
+            # Stream output từng dòng
+            for line in proc.stdout:
+                self._send_shell_output(line)
+            
+            proc.wait(timeout=30)
+            
+            if proc.returncode != 0:
+                self._send_shell_output(f"[exit code: {proc.returncode}]\n")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self._send_shell_output("\n⏰ Timeout (30s)\n")
+        except Exception as e:
+            self._send_shell_output(f"\n❌ Error: {e}\n")
+        
+        # Gửi EOT marker
+        self._send_shell_output("\x04")
+
+    def _send_shell_output(self, text):
+        global _shell_output_char
+        if _shell_output_char:
+            _shell_output_char.send_output(text)
+
+class ShellOutputCharacteristic(dbus.service.Object):
+    """Characteristic Notify để stream shell output về Flutter."""
+    
+    CCCD_UUID = '00002902-0000-1000-8000-00805f9b34fb'
+
+    def __init__(self, bus, index, service):
+        self.path = service.path + '/char' + str(index)
+        self.bus = bus
+        self.uuid = SHELL_CHRC_UUID
+        self.service = service
+        self.flags = ['notify', 'read']
+        self.notifying = False
+        self.value = []
+        dbus.service.Object.__init__(self, bus, self.path)
+    
+    def get_properties(self):
+        return {
+            GATT_CHRC_IFACE: {
+                'Service': self.service.get_path(),
+                'UUID': self.uuid,
+                'Flags': self.flags,
+                'Value': dbus.Array(self.value, signature='y'),
+                'Descriptors': dbus.Array([], signature='o'),
+            }
+        }
+    
+    def get_path(self): return dbus.ObjectPath(self.path)
+    
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface): return self.get_properties()[GATT_CHRC_IFACE]
+    
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
+    def ReadValue(self, options):
+        # Trả về CWD hiện tại khi Read
+        global _shell_cwd
+        prompt = f"{_shell_cwd}"
+        return dbus.Array([dbus.Byte(b) for b in prompt.encode('utf-8')], signature='y')
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='', out_signature='')
+    def StartNotify(self):
+        self.notifying = True
+        print("🔔 Shell Notify: ON")
+        global _shell_cwd, _ble_connected
+        _ble_connected = True
+        # Hiển thị trạng thái kết nối trên LCD
+        show_message(["đã kết nối", "", "bật mic trên app", "để sử dụng"], (100, 255, 100))
+        self.send_output(f"📂 {_shell_cwd}\n")
+
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature='', out_signature='')
+    def StopNotify(self):
+        self.notifying = False
+        print("🔕 Shell Notify: OFF")
+        global _ble_connected
+        _ble_connected = False
+        # Hiển thị lại màn hình chờ kết nối
+        show_message(["vui lòng", "kết nối ble"], (100, 200, 255))
+
+    def send_output(self, text):
+        if not self.notifying:
+            return
+        try:
+            data = text.encode('utf-8')
+            # Chunk output nếu quá dài (BLE MTU ~500 bytes)
+            chunk_size = 500
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i + chunk_size]
+                value = dbus.Array([dbus.Byte(b) for b in chunk], signature='y')
+                self.PropertiesChanged(
+                    GATT_CHRC_IFACE,
+                    {'Value': value},
+                    []
+                )
+                if len(data) > chunk_size:
+                    time.sleep(0.02)  # Delay nhỏ giữa chunks
+        except Exception as e:
+            print(f"❌ Shell notify error: {e}")
+
+    @dbus.service.signal(DBUS_PROP_IFACE, signature='sa{sv}as')
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
 
 class WifiSetupApplication(dbus.service.Object):
     def __init__(self, bus):
@@ -642,6 +825,12 @@ class WifiSetupApplication(dbus.service.Object):
         # Thêm characteristic cho VSL
         vsl_chrc = VslCharacteristic(bus, 2, wifi_service)
         wifi_service.characteristics.append(vsl_chrc)
+
+        # Thêm characteristic cho Shell output (Notify)
+        global _shell_output_char
+        shell_chrc = ShellOutputCharacteristic(bus, 3, wifi_service)
+        wifi_service.characteristics.append(shell_chrc)
+        _shell_output_char = shell_chrc
         
         self.services.append(wifi_service)
 

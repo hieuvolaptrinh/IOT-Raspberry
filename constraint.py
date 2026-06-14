@@ -24,6 +24,7 @@ WIFI_SERVICE_UUID = '00001234-0000-1000-8000-00805f9b34fb'
 WIFI_CHRC_UUID = '0000abcd-0000-1000-8000-00805f9b34fb'   # Write: WiFi + ENV config
 IP_CHRC_UUID = '0000abce-0000-1000-8000-00805f9b34fb'     # Read:  IP info
 VSL_CHRC_UUID = '0000abcf-0000-1000-8000-00805f9b34fb'    # Write: VSL Result data
+SHELL_CHRC_UUID = '0000abd0-0000-1000-8000-00805f9b34fb'  # Notify: Shell output
 
 # ============ DISPLAY SETTINGS ============
 MIRROR_MODE = True
